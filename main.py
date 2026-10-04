@@ -716,6 +716,8 @@ class JarvisLive:
         self._quick_failures  = 0       # consecutive sessions that died young
         self._conn_backoff    = 3
         self._go_away_pending = False   # a GoAway refresh is already scheduled
+        self._first_session   = True    # the next connect is the app's first
+        self._reset_tool_turn()         # loop-guard counters (see _loop_guard)
         self._wants_alpha     = False   # set by _build_config: v1alpha-only fields in use
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
@@ -968,6 +970,9 @@ class JarvisLive:
         # conversation a reconnect has to be able to restore.
         if text and not text.lstrip().startswith("["):
             self._recent_turns.append(f"User (typed): {text.strip()}")
+            # Typing is the user talking, as far as the briefing, proactive
+            # check-ins and auto-sleep are concerned.
+            self._last_user_speech = time.monotonic()
         # Not dropped while the link is down: a message typed during a
         # reconnect used to vanish without a trace. It now waits for the
         # session to come back, and says so if it never does.
@@ -1364,6 +1369,67 @@ class JarvisLive:
 
         return out
 
+    # ── Tool-loop guard ──────────────────────────────────────────────────────
+    # Measured against the live server: right after a new session, asked for
+    # something memory did not hold, the model called recall_memory with the
+    # same two queries, alternating, more than sixty times — and never said a
+    # word. To the user the assistant had simply gone deaf. Nothing in the
+    # protocol stops that, so the app does: identical calls are answered from
+    # the first result, and a run of calls with no speech in between is told
+    # to stop and answer. Speech from either side starts the count over, so an
+    # ordinary multi-step task that narrates as it goes is never affected.
+    _MAX_TOOLS_SILENT   = 15     # calls in one turn without a word spoken
+    _MAX_SAME_TOOL      = 6      # calls to one tool in one turn
+    _MAX_SAME_TOOL_LOW  = {"recall_memory": 2}   # where a third try is pointless
+
+    def _reset_tool_turn(self) -> None:
+        self._turn_tools = 0
+        self._turn_tool_names: dict[str, int] = {}
+        self._turn_tool_seen: dict[str, str] = {}
+
+    @staticmethod
+    def _call_sig(fc) -> str:
+        try:
+            return f"{fc.name}:{json.dumps(dict(fc.args or {}), sort_keys=True, default=str)}"
+        except Exception:
+            return f"{fc.name}:{fc.args!r}"
+
+    def _loop_guard(self, fc) -> types.FunctionResponse | None:
+        """None → run the tool. Otherwise the response to send instead."""
+        if not hasattr(self, "_turn_tools"):
+            self._reset_tool_turn()
+        name = fc.name
+        self._turn_tools += 1
+        self._turn_tool_names[name] = self._turn_tool_names.get(name, 0) + 1
+        sig = self._call_sig(fc)
+
+        msg = None
+        if sig in self._turn_tool_seen:
+            msg = (f"You already called {name} with exactly these arguments in this "
+                   f"turn. The result was: {self._turn_tool_seen[sig][:600]} — "
+                   f"calling it again will not change it. Do not call it again; "
+                   f"answer the user now.")
+        elif self._turn_tool_names[name] > self._MAX_SAME_TOOL_LOW.get(name, self._MAX_SAME_TOOL):
+            msg = (f"STOP calling {name}: it has been called "
+                   f"{self._turn_tool_names[name] - 1} times for this request without "
+                   f"an answer. Reply to the user now with what you know. If you do "
+                   f"not know, say so plainly.")
+        elif self._turn_tools > self._MAX_TOOLS_SILENT:
+            msg = (f"Tool limit for this request reached ({self._turn_tools - 1} calls "
+                   f"without a word to the user). Do not call any more tools — speak "
+                   f"to the user now: say what you did and what is left.")
+        if msg is None:
+            return None
+        print(f"[JARVIS] 🛑 Loop guard: {name} blocked ({self._turn_tools} calls this turn)")
+        return types.FunctionResponse(id=fc.id, name=name, response={"result": msg})
+
+    def _remember_call(self, fc, fr) -> None:
+        try:
+            res = (fr.response or {}).get("result", "")
+            self._turn_tool_seen[self._call_sig(fc)] = str(res)
+        except Exception:
+            pass
+
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
@@ -1396,6 +1462,13 @@ class JarvisLive:
                 # hundred short strings, and a thread hop would cost more than
                 # the work itself.
                 result = search_memory(args.get("query", ""), limit=8)
+                if result.startswith("Nothing stored"):
+                    # Say it is final. A bare "nothing stored" read as "try
+                    # another keyword", and the model did — over and over.
+                    result += (" The whole memory was searched; this is final. Do not "
+                               "search again. Answer from the conversation if it was "
+                               "mentioned there; otherwise tell the user you do not "
+                               "have it stored.")
 
             elif name == "undo":
                 if str(args.get("action", "")).lower().strip() == "list":
@@ -1747,7 +1820,7 @@ class JarvisLive:
                         _left = _parse_seconds(getattr(_ga, "time_left", None))
                         print(f"[JARVIS] ⏳ Server GoAway — link closes in ~{_left:.0f}s; "
                               f"refreshing it between turns.")
-                        asyncio.create_task(self._refresh_link_before(_left))
+                        asyncio.create_task(self._refresh_link_before(_left, self.session))
 
                     if response.data:
                         if self._interrupted:
@@ -1766,6 +1839,9 @@ class JarvisLive:
                         sc = response.server_content
 
                         if sc.output_transcription and sc.output_transcription.text:
+                            # The assistant is talking: whatever tools it used
+                            # got it somewhere, so the loop guard starts over.
+                            self._reset_tool_turn()
                             txt = _clean_transcript(sc.output_transcription.text)
                             # A turn that involves a tool call passes through
                             # several turn_completes, and the API re-sends the
@@ -1787,6 +1863,7 @@ class JarvisLive:
                             if txt:
                                 in_buf.append(txt)
                                 self._last_user_speech = time.monotonic()
+                                self._reset_tool_turn()   # a new request
 
                         if sc.turn_complete:
                             if self._turn_done_event:
@@ -1846,7 +1923,10 @@ class JarvisLive:
                         fn_responses = []
                         for fc in response.tool_call.function_calls:
                             print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
+                            fr = self._loop_guard(fc)
+                            if fr is None:
+                                fr = await self._execute_tool(fc)
+                                self._remember_call(fc, fr)
                             fn_responses.append(fr)
                         await self.session.send_tool_response(
                             function_responses=fn_responses
@@ -1861,17 +1941,23 @@ class JarvisLive:
                 traceback.print_exc()
             raise
 
-    async def _refresh_link_before(self, time_left: float) -> None:
+    async def _refresh_link_before(self, time_left: float, for_session) -> None:
         """Rebuild the connection before the server's GoAway deadline, waiting
-        for a gap in the conversation so nothing is cut off mid-sentence."""
+        for a gap in the conversation so nothing is cut off mid-sentence.
+
+        Bound to the session that received the GoAway. This task lives outside
+        the session's TaskGroup, so if that session died first and a new one
+        connected while it waited, it used to tear the NEW session down too."""
         deadline = time.monotonic() + max(0.0, time_left - 1.5)
         while time.monotonic() < deadline:
+            if self.session is not for_session:
+                return                      # that session is already gone
             with self._speaking_lock:
                 speaking = self._is_speaking
             if not speaking and not self._vision_busy:
                 break
             await asyncio.sleep(0.2)
-        if self._reconnect_event is None or not self.session:
+        if self._reconnect_event is None or self.session is not for_session:
             return
         # With a handle this is a seamless resume; without one (none issued yet)
         # the transcript carries the conversation over instead.
@@ -1925,6 +2011,7 @@ class JarvisLive:
         except Exception:
             pass
 
+        write_fut: asyncio.Future | None = None   # the batch being written right now
         try:
             while True:
                 try:
@@ -2004,17 +2091,45 @@ class JarvisLive:
                 except Exception:
                     pass
 
+                # Shielded so a session ending mid-write cancels only the wait,
+                # not the write: the worker thread finishes its batch and the
+                # teardown below knows when it is safe to close the stream.
+                write_fut = asyncio.ensure_future(
+                    asyncio.to_thread(stream.write, bytes(batch)))
                 try:
-                    await asyncio.to_thread(stream.write, bytes(batch))
+                    await asyncio.shield(write_fut)
                 except (RuntimeError, asyncio.CancelledError):
-                    break   # executor shutting down — exit cleanly
+                    break   # session ending / executor shutting down — exit cleanly
         except Exception as e:
             print(f"[JARVIS] ❌ Play: {e}")
             raise
         finally:
             self.set_speaking(False)
-            stream.stop()
-            stream.close()
+            # The session is over, so whatever is still buffered is a sentence
+            # nobody will hear the end of. stop() played it out — measured at
+            # 300-400 ms with the WHOLE event loop frozen, mic and receive
+            # included, on every reconnect — and closed the stream while a
+            # write could still be running in its worker thread. Now: let the
+            # in-flight batch (≤200 ms) finish, then abort and close off-loop.
+            pending = write_fut
+
+            def _teardown():
+                # Looked up inside the try: teardown must never be the thing
+                # that fails, whatever kind of stream object this is.
+                for meth in ("abort", "close"):
+                    try:
+                        getattr(stream, meth)()
+                    except Exception:
+                        pass
+
+            try:
+                if pending is not None and not pending.done():
+                    await asyncio.wait({pending}, timeout=0.5)
+                if pending is not None and pending.done() and not pending.cancelled():
+                    pending.exception()          # retrieve, so it is never "unobserved"
+                await asyncio.to_thread(_teardown)
+            except BaseException:
+                _teardown()
 
     # ── Morning briefing ────────────────────────────────────────────────────────
 
@@ -2077,10 +2192,12 @@ class JarvisLive:
         if self._turn_done_event:
             self._turn_done_event.clear()
 
+        greet_session = self.session
         await self.session.send_client_content(
             turns={"role": "user", "parts": [{"text": p1}]},
             turn_complete=True,
         )
+        greet_t = time.monotonic()
         print("[JARVIS] Briefing phase 1 (greeting) sent.")
 
         # ── Phase 2: fire as soon as Phase 1 audio is done ───────────────────
@@ -2116,7 +2233,10 @@ class JarvisLive:
                     self.ui.write_log(f"SYS: News fetch timed out/failed: {e!r}")
                     news_text = ""
 
-                if not self.session:
+                # This task lives outside the session's TaskGroup: if the link
+                # was rebuilt while it waited, the news must not be pushed into
+                # the new session as if it were the start of the conversation.
+                if self.session is None or self.session is not greet_session:
                     return
 
                 failed = (not news_text) or news_text.startswith(
@@ -2125,6 +2245,17 @@ class JarvisLive:
                 if not failed:
                     # Show on UI content panel immediately
                     self.ui.show_content("NEWS — top world news today", news_text)
+
+                # The user got in first. Right after the greeting is exactly
+                # when people start talking, and injecting the news then landed
+                # on top of their request — the briefing answered instead of
+                # them. Their request wins; the headlines stay on screen.
+                if self._last_user_speech > greet_t:
+                    print("[JARVIS] Briefing phase 2 skipped — the user is already talking.")
+                    if not failed:
+                        self.ui.write_log("SYS: Headlines are on screen — skipped reading "
+                                          "them out because you were talking.")
+                    return
 
                     p2 = (
                         f"[BRIEFING] Here are today's top news headlines:\n{news_text}\n\n"
@@ -2409,6 +2540,7 @@ class JarvisLive:
                     self._turn_done_event = asyncio.Event()
 
                     # Reset transient state that must not carry over from a previous session
+                    self._reset_tool_turn()
                     self._pending_vision       = None
                     self._vision_cam_active    = False
                     self._vision_close_pending = False
@@ -2432,17 +2564,27 @@ class JarvisLive:
                                   f"{len(self._recent_turns)} turns")
                             self.ui.write_log("SYS: Reconnected — conversation carried over.")
 
-                    # Wake word: if enabled, come up ASLEEP (mic gated, silent)
-                    # until the user says "Hey Jarvis" or taps wake in the UI.
+                    # Wake word: if enabled, the app comes up ASLEEP (mic gated,
+                    # silent) until the user says "Hey Jarvis" or taps wake.
+                    # Only on the FIRST session, though. A reconnect — a server
+                    # 1011, a GoAway refresh, a device change — used to force
+                    # it back to sleep mid-conversation, so the assistant went
+                    # deaf every time the link was rebuilt.
                     if self._wake_enabled:
                         self._ensure_wake_detector()
-                        self._awake = False
-                        self.ui.set_state("SLEEPING")
-                        self.ui.write_log("SYS: JARVIS online — sleeping. Say 'Hey Jarvis' to wake me.")
+                        if self._first_session:
+                            self._awake = False
                     else:
                         self._awake = True
-                        self.ui.set_state("LISTENING")
-                        self.ui.write_log("SYS: JARVIS online.")
+                    if self._awake:
+                        if not self.ui.muted:
+                            self.ui.set_state("LISTENING")
+                        self.ui.write_log("SYS: JARVIS online." if self._first_session
+                                          else "SYS: Link re-established — listening.")
+                    else:
+                        self.ui.set_state("SLEEPING")
+                        self.ui.write_log("SYS: JARVIS online — sleeping. Say 'Hey Jarvis' to wake me.")
+                    self._first_session = False
 
                     if self._dashboard:
                         await self._dashboard.broadcast({"type": "status", "state": "active"})

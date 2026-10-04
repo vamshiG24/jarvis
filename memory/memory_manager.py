@@ -353,7 +353,11 @@ def search_memory(query: str, limit: int = 8) -> str:
     An empty query is treated as "show me everything you know", capped - the
     model asks that when the user says "what do you remember about me?"."""
     memory = load_memory()
-    words  = [w for w in re.split(r"[^\w]+", (query or "").lower()) if len(w) > 1]
+    # Split on underscores too. `\w` includes "_", so a snake_case query — the
+    # form the model itself uses for keys, e.g. "code_word" — stayed one token
+    # and was compared against the prettified key "code word": never a match,
+    # so a fact saved a minute earlier came back "Nothing stored".
+    words  = [w for w in re.split(r"[\W_]+", (query or "").lower()) if len(w) > 1]
 
     rows: list[tuple[int, str, str, str]] = []
     for cat, items in memory.items():

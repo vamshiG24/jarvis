@@ -69,6 +69,15 @@ Nexus sphere renders in about 5 ms per frame, and idle repaint stays at around 2
 * **Folder lookups recover instead of dead-ending.** A path built on the default layout is remapped to the real folder automatically. A miss now returns the closest real names ("did you mean …"), and `find` matches folders as well as files.
 * **Scanned and image-only PDFs can be read.** Lecture slides exported as pictures used to stop at "may be scanned". The PDF is now sent to Gemini, which reads the page images (OCR included); this takes about 8–10 s for a 6-page lecture.
 * **Telugu, Hindi, Tamil, Bengali and other scripts render properly**, and the console no longer fills with `qt.text.font.db: OpenType support missing…` lines.
+* **The assistant no longer goes silent after a new session.** Tested with real voice against the live server: after a reconnect it could get stuck calling `recall_memory` over and over (more than 60 times) without ever answering. Three fixes:
+  - Memory search failed on the model's own `snake_case` keys, so facts it had just saved came back "Nothing stored".
+  - A miss now says the search is final.
+  - A loop guard stops repeated or runaway tool calls and tells the model to answer.
+* **Cleaner session switches.**
+  - Teardown no longer freezes the event loop for 300–400 ms while buffered audio plays out.
+  - A stale GoAway refresh can no longer tear down the *next* session.
+  - Wake-word mode no longer falls asleep on every reconnect.
+  - The startup news briefing is skipped if you start talking first, instead of landing on top of your request.
 * **Closing the window is no longer silent.** It prints `Window closed`, saves the conversation summary that used to be lost, and `faulthandler` reports a real crash if one ever happens. Ctrl+C in the terminal now closes the app properly.
 
 ---
