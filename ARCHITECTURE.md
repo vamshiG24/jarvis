@@ -1,0 +1,342 @@
+# MARK LV — Architecture
+
+> **Maintained by Gowni Vamshi** · based on [MARK LV](https://github.com/FatihMakes/Mark-LV) by FatihMakes (CC BY-NC 4.0)
+
+This document shows how the assistant is put together: the processes and
+threads it runs, how audio and tool calls flow through it, and how a Live
+session survives the server dropping it. The diagrams are [Mermaid](https://mermaid.js.org/)
+and render directly on GitHub; an ASCII version of the overview comes first for
+reading in a terminal.
+
+---
+
+## 1. The big picture
+
+```text
+                ┌──────────────────────────────── YOUR COMPUTER ─────────────────────────────────┐
+                │                                                                                │
+  🎤 Mic ──────▶│  sounddevice ──▶ EchoGuard / Wake word / PTT gate ──▶ out_queue ─┐             │
+                │                                                                  │             │
+  🔊 Speakers ◀─│  RawOutputStream ◀── audio_in_queue ◀──┐                         ▼             │       ┌────────────────────┐
+                │        │ visemes / level               │                ┌─────────────────┐    │  WSS  │  Gemini Live API   │
+                │        ▼                               └────────────────│   JarvisLive    │◀───┼──────▶│  gemini-3.1-flash- │
+                │  ┌───────────────┐   Qt signals    ┌────────────┐       │  (main.py,      │    │       │  live-preview      │
+                │  │  PyQt6 HUD    │◀───────────────▶│ JarvisUI   │◀─────▶│   asyncio loop) │    │       └────────────────────┘
+                │  │  (ui.py)      │                 │  facade    │       └───────┬─────────┘    │       ┌────────────────────┐
+                │  │ Nexus · Face  │                 └────────────┘               │ tool calls   │ HTTPS │ Gemini REST models │
+                │  │ · Core        │                                              ▼              │◀─────▶│ (one-shot ladder,  │
+                │  └───────────────┘                      ┌────────────────────────────────────┐ │       │  core/gemini.py)   │
+                │                                         │ Inline tools │ actions/*.py │ plugins│ │       └────────────────────┘
+                │  📱 Phone ◀── HTTPS :8000 ──▶ Dashboard │ (vision,     │ (open_app,   │ (drop- │ │
+                │               (FastAPI)  commands/audio │  memory, …)  │  files, web…)│  in)   │ │
+                │                                         └──────────────┬─────────────────────┘ │
+                │                         memory/long_term.json ◀────────┘  config/api_keys.json │
+                └────────────────────────────────────────────────────────────────────────────────┘
+```
+
+```mermaid
+flowchart LR
+    subgraph USER["👤 User"]
+        MIC["🎤 Microphone"]
+        SPK["🔊 Speakers"]
+        KB["⌨️ Keyboard / text box"]
+        PHONE["📱 Phone browser"]
+    end
+
+    subgraph APP["🖥️ MARK LV process"]
+        direction TB
+        subgraph UI_THREAD["Qt main thread — ui.py"]
+            HUD["HudCanvas<br/>Nexus · Face · Core"]
+            PANELS["Telemetry tiles · Activity log<br/>Drawers · Overlays"]
+            FACADE["JarvisUI facade<br/>(thread-safe signals)"]
+        end
+        subgraph LOOP["asyncio thread — main.py"]
+            LIVE["JarvisLive<br/>session lifecycle"]
+            TOOLS["Tool dispatcher"]
+        end
+        subgraph REG["Skill registries"]
+            INLINE["Inline tools<br/>screen_process · save/recall_memory<br/>undo · manage_monitor · shutdown"]
+            ACTIONS["actions/*.py<br/>auto-discovered TOOL dicts"]
+            PLUGINS["plugins/*.py<br/>drop-in, crash-isolated"]
+        end
+        DASH["Dashboard<br/>FastAPI · HTTPS :8000"]
+        MEM[("memory/long_term.json")]
+        CFG[("config/api_keys.json")]
+    end
+
+    subgraph GOOGLE["☁️ Google"]
+        GLIVE["Gemini Live API<br/>bidirectional WebSocket"]
+        GREST["Gemini REST models<br/>one-shot ladder"]
+    end
+
+    MIC --> LIVE
+    LIVE --> SPK
+    KB --> FACADE
+    PHONE <--> DASH
+    DASH --> LIVE
+    FACADE <--> LIVE
+    HUD --- FACADE
+    PANELS --- FACADE
+    LIVE <-->|"PCM 16 kHz up · PCM 24 kHz down<br/>tool calls · transcripts"| GLIVE
+    LIVE --> TOOLS
+    TOOLS --> INLINE & ACTIONS & PLUGINS
+    ACTIONS & PLUGINS -->|"core/gemini.py"| GREST
+    INLINE <--> MEM
+    LIVE <--> CFG
+```
+
+---
+
+## 2. Threads and tasks
+
+The app runs two long-lived threads. Qt owns the main thread; everything that
+talks to Gemini runs on one asyncio loop in a daemon thread. They only meet
+through `JarvisUI`, whose methods emit Qt signals, so no widget is ever touched
+from the wrong thread.
+
+```mermaid
+flowchart TB
+    subgraph MAIN["Main thread"]
+        QAPP["QApplication.exec()<br/>MainWindow · HudCanvas 60 Hz step / 20–30 Hz paint"]
+    end
+    subgraph RUNNER["Daemon thread: asyncio.run(JarvisLive.run())"]
+        direction TB
+        RUN["run() — connect / recover loop"]
+        subgraph TG["asyncio.TaskGroup — one per Live session"]
+            T1["_send_realtime<br/>out_queue → WebSocket"]
+            T2["_listen_audio<br/>mic stream (callback thread)"]
+            T3["_receive_audio<br/>server messages · tools · GoAway"]
+            T4["_play_audio<br/>audio_in_queue → speakers · visemes"]
+            T5["_watch_reconnect<br/>voluntary rebuilds"]
+            T6["_run_system_monitor"]
+            T7["_run_background_monitor"]
+            T8["_run_proactive_mode"]
+            T9["_run_sleep_watch"]
+            T10["_relay_phone_audio"]
+        end
+        BG["Lifetime tasks<br/>dashboard.serve · dashboard command relay"]
+    end
+    subgraph POOL["Thread pool (run_in_executor)"]
+        EXE["Blocking tool handlers<br/>actions · plugins · screen capture"]
+    end
+    RUN --> TG
+    T3 --> EXE
+    RUNNER <-->|"Qt signals via JarvisUI"| MAIN
+```
+
+If any task in the group raises, the whole group is torn down and `run()`
+decides what to do next (see §5). One failure path covers every way a session
+can end.
+
+---
+
+## 3. Audio pipeline
+
+```mermaid
+flowchart LR
+    MIC["🎤 Mic<br/>16 kHz int16<br/>1024-sample blocks"] --> CB["Input callback"]
+    CB --> WAKE{"Wake-word<br/>asleep?"}
+    WAKE -->|yes| DET["openWakeWord detector<br/>(own thread, local)"]
+    DET -.->|Hey Jarvis| WAKE
+    WAKE -->|no| SPEAK{"Assistant<br/>speaking?"}
+    SPEAK -->|yes| DROP1["dropped"]
+    SPEAK -->|no| TAIL{"Echo tail<br/>active?"}
+    TAIL -->|own echo| DROP2["dropped"]
+    TAIL -->|real voice or no tail| PTT{"Push-to-talk on<br/>and key not held?"}
+    PTT -->|yes| DROP3["dropped"]
+    PTT -->|no| OQ["out_queue"] --> WS["send_realtime_input(audio)"] --> GL["Gemini Live"]
+
+    GL --> RX["receive()"] --> SLICE["50 ms slices<br/>(fast interrupt)"] --> AQ["audio_in_queue"]
+    AQ --> BATCH["≤200 ms batch"] --> OUT["RawOutputStream<br/>24 kHz"] --> SPK["🔊"]
+    BATCH --> VIS["FFT visemes<br/>openness · width · level"] --> HUD["HUD mouth / sphere / waveform"]
+    BATCH --> EG["EchoGuard.note_output<br/>(learns own voice)"]
+    EG -.-> TAIL
+```
+
+* **Echo tail.** `stream.write()` returns before the sound has left the
+  speakers, so for `output latency + 250 ms` after speaking the microphone is
+  filtered by `core/echo.py`: blocks that match the assistant's own voice are dropped, and
+  a real reply still gets through.
+* **Visemes.** `_pcm_visemes()` reads F1/F2 formant energy from each 20 ms of
+  outgoing audio. That drives the face's mouth, the Nexus sphere's ripple and the
+  waveform, all from one source so they stay in sync.
+
+---
+
+## 4. A tool call, end to end
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant G as Gemini Live
+    participant R as _receive_audio
+    participant X as _execute_tool
+    participant H as Handler (thread pool)
+    participant UI as HUD
+
+    U->>G: "Open WhatsApp" (streamed PCM)
+    G-->>R: tool_call open_app {app_name}
+    R->>UI: set_state(THINKING)
+    R->>X: execute(fc)
+    X->>H: run_in_executor(action.handler)
+    H-->>X: "Opened WhatsApp."
+    X-->>R: FunctionResponse(id, result)
+    Note over X,R: scheduling only on 2.5 models —<br/>3.x Live is synchronous-only
+    R->>G: send_tool_response()
+    opt screen_process captured an image
+        R->>G: send_client_content(image + question)
+    end
+    G-->>R: audio + transcription
+    R->>UI: log line · visemes · SPEAKING
+```
+
+Tools come from three registries, checked in this order:
+
+| Registry | Where | How it's found |
+|---|---|---|
+| Inline | `TOOL_DECLARATIONS` in `main.py` | Tied to live-session state (vision, memory, shutdown) |
+| Actions | `actions/*.py` | Any module exporting a `TOOL` dict (`core/action_loader.py`) |
+| Plugins | `plugins/*.py` | Drop-in files, validated and crash-isolated (`core/plugin_loader.py`) |
+
+Names can't collide: actions can't shadow inline tools, and plugins can't shadow either.
+
+---
+
+## 5. Session lifecycle and recovery
+
+This is the part that changed most in this build. The Live server can end a
+session in several ways, and each one now has its own way back.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Connecting
+    Connecting --> Online: connect ok
+    Connecting --> Recovering: quota / model unavailable
+    Online --> Refreshing: GoAway (connection lifetime)
+    Refreshing --> Connecting: resume with handle,<br/>between turns
+    Online --> Connecting: voice / device change<br/>(voluntary rebuild)
+    Online --> Recovering: 1011 internal error
+    Online --> Offline: network drop (1006) / other
+    Recovering --> Connecting: drop poisoned handle,<br/>seed transcript recap,<br/>backoff 1→2→5→10→20→30 s
+    Offline --> Connecting: backoff
+    Connecting --> Connecting: resumed session dies within 20 s<br/>→ drop handle, recap
+```
+
+**How each failure is handled**
+
+| Failure | Detected by | What happens |
+|---|---|---|
+| `1011 Internal error encountered` | close code from the leaf exception | Resumption handle **dropped** (resuming replays the broken state). A fresh session starts with the last 24 turns in its system instruction. Gentle backoff if it repeats. |
+| `1011 Resource has been exhausted` / 429 | `core/gemini.is_quota_error` | Step down the Live model ladder. |
+| Resumed session dies within 20 s | connection age | Handle dropped, conversation carried over from the transcript. |
+| `GoAway` from server | `response.go_away` | Rebuild on the resumption handle at the next quiet moment, before the deadline. |
+| Voice change | `_ReconnectSignal(keep_context=False)` | New session (the voice is fixed at connect), with the conversation seeded from the transcript. |
+| Bad API key | `api key not valid` | Setup screen reopens and the app waits for a new key. |
+| Unsupported config field (1007/1008, INVALID_ARGUMENT) | leaf error text | Tuning knobs dropped first, then proactive audio. |
+| Network drop (1006, timeouts) | close code / error text | Exponential backoff, up to 60 s. |
+
+**Why "leaf" exceptions.** A session runs in a `TaskGroup`, so failures arrive
+wrapped in an `ExceptionGroup` whose message is *"unhandled errors in a
+TaskGroup"*. The old code matched keywords against that wrapper text, and
+`"unhandled"` contains `"handle"`. So every failure after a resume looked like a
+rejected resumption handle, and quota errors raised mid-session were never
+recognised. `_leaf_errors()`, `_close_code()` and `_error_text()` in `main.py`
+always look inside the group.
+
+**Model-aware config.** `_is_gen3_live()` keeps settings that
+`gemini-3.1-flash-live` doesn't support out of the config:
+
+| Setting | 2.5 native-audio | 3.x Live |
+|---|---|---|
+| Proactive audio (`v1alpha`) | ✅ on | ❌ omitted, `v1beta` used |
+| Context-window compression | ✅ on | ❌ off by default (the identified 1011 trigger) |
+| Thinking | `thinking_budget` | `thinking_level` |
+| Tool `behavior` / `scheduling` | sent | stripped (sync calls only) |
+
+---
+
+## 6. UI composition
+
+```mermaid
+flowchart TB
+    subgraph WIN["MainWindow (QMainWindow)"]
+        direction TB
+        HDR["Header — logo · ⚙ Setup · 🎛 Controls · title · link chip · clock<br/>+ animated scan line"]
+        subgraph BODY["Body"]
+            direction LR
+            LEFT["Left panel<br/>Telemetry tiles (sparklines)<br/>CPU · MEM · NET · GPU · TMP<br/>uptime · processes · OS"]
+            subgraph CENTER["Centre (QSplitter)"]
+                STACK["QStackedWidget<br/>0 HudCanvas · 1 Camera · 2 Video"]
+                CONTENT["Content panel<br/>search · news · reviews"]
+                QUIZ["Quiz panel"]
+            end
+            RIGHT["Right panel<br/>Activity log (speaker badges)<br/>File drop · Command input<br/>Interrupt · Mic"]
+        end
+        FTR["Footer — shortcuts · maintainer credit · original author credit"]
+    end
+    OVER["Floating overlays<br/>Setup · Customise · Audio devices · Memory · Plugins<br/>Remote QR · Confirm banner · Clipboard · Camera preview"]
+    WIN --- OVER
+```
+
+**HUD styles.** These live in `HudCanvas`; the 🎛 HUD button cycles through them and the choice is saved as `hud_style`:
+
+| Style | What it draws |
+|---|---|
+| `nexus` *(default)* | A 340-point Fibonacci sphere that ripples with speech and assembles itself on boot. Around it: tilted orbit rings with satellites, a segmented ring that chases while thinking, a radial voice trail (the last 1.6 s of audio), a radar sweep, a hex-lattice backdrop, and live corner telemetry (link, session timer, voice meter, state). |
+| `face` | The original holographic head with formant-driven lip-sync and facial acting (`core/avatar.py`). |
+| `core` | The original reactor core. |
+
+Everything is drawn in software with `QPainter`, so no GPU or OpenGL is needed.
+The Nexus sphere is rotated with numpy and drawn as four depth buckets, one pen
+change each, at about 5 ms per frame.
+
+---
+
+## 7. Module map
+
+```mermaid
+flowchart LR
+    MAINPY["main.py"] --> UIPY["ui.py"]
+    MAINPY --> CORE
+    MAINPY --> MEMPKG
+    MAINPY --> ACTS
+    UIPY --> AVATAR["core/avatar.py<br/>core/avatar_mesh.py"]
+    UIPY --> MEMPKG
+    subgraph CORE["core/"]
+        GEM["gemini.py — one-shot model ladder"]
+        AL["action_loader.py"]
+        PL["plugin_loader.py"]
+        ECHO["echo.py"]
+        VIS["viseme.py"]
+        AD["audio_devices.py"]
+        WW["wake_word.py"]
+        HK["hotkey.py"]
+        UNDO["undo.py"]
+        CONF["confirm.py"]
+        PROMPT["prompt.txt"]
+    end
+    subgraph MEMPKG["memory/"]
+        MM["memory_manager.py"]
+        CM["config_manager.py"]
+    end
+    subgraph ACTS["actions/"]
+        A1["open_app · browser_control · file_controller"]
+        A2["web_search · screen_processor · video_player"]
+        A3["computer_settings · computer_control · desktop"]
+        A4["reminder · weather_report · send_message · …"]
+    end
+    DASHB["dashboard/server.py"] --> MAINPY
+```
+
+---
+
+## 8. Data on disk
+
+| File | Contents | In git? |
+|---|---|---|
+| `config/api_keys.json` | Gemini key, OS, names, voice, colour, toggles, plugin settings | ❌ ignored |
+| `config/certs/` | Self-signed TLS key and certificate for the phone dashboard | ❌ ignored |
+| `memory/long_term.json` | What the assistant remembers about you, plus session summaries | ❌ ignored |
+| `core/prompt.txt` | System-prompt template; `{tokens}` are filled in at connect | ✅ |
+| `core/face_model.obj` | MediaPipe canonical face (Apache-2.0) | ✅ |
