@@ -177,6 +177,49 @@ def _process_image(path: Path, action: str, params: dict, speak=None) -> str:
 
     return _process_image(path, "describe", {"instruction": f"{action}: {params}"})
 
+# Inline request limit is ~20 MB; stay under it with room for the prompt.
+_PDF_INLINE_MAX = 18 * 1024 * 1024
+
+
+def _pdf_pages_as_images(path: Path, max_pages: int = 20) -> list:
+    """Render pages to JPEG parts — for PDFs too large to send whole."""
+    import io
+    import pypdfium2 as pdfium
+    from google.genai import types as gtypes
+
+    parts = []
+    doc = pdfium.PdfDocument(str(path))
+    try:
+        for i in range(min(len(doc), max_pages)):
+            img = doc[i].render(scale=1.6).to_pil().convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=80)
+            parts.append(gtypes.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"))
+    finally:
+        doc.close()
+    return parts
+
+
+def _pdf_via_gemini(path: Path, instruction: str) -> str:
+    """Read a PDF the way a person would — as pages.
+
+    For files with no text layer: scans, photographed handouts, and lecture
+    slides exported as one picture per page. Text extraction returns nothing
+    for those, which used to end the request with "may be scanned"; Gemini
+    reads the pages themselves instead, OCR included."""
+    from google.genai import types as gtypes
+
+    if path.stat().st_size <= _PDF_INLINE_MAX:
+        parts = [gtypes.Part.from_bytes(data=path.read_bytes(),
+                                        mime_type="application/pdf")]
+    else:
+        parts = _pdf_pages_as_images(path)
+    resp = gemini.call(parts + [instruction], tier=gemini.DOCUMENT, timeout_ms=120_000)
+    if resp is None:
+        raise RuntimeError("every Gemini model on the document ladder failed")
+    return (getattr(resp, "text", None) or "").strip()
+
+
 def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
     action = action or "summarize"
 
@@ -201,7 +244,36 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
     if action in ("summarize", "extract_text", "translate_hint", "analyze", "reformat"):
         text = _extract_pdf_text()
         if not text.strip():
-            return "Could not extract text from PDF (may be scanned/image-based)."
+            # No text layer — scanned or image-only. Read the pages instead.
+            print(f"[FileProcessor] {path.name}: no text layer — reading pages with Gemini")
+            instruction = {
+                "extract_text": "Transcribe all text in this document, page by page. "
+                                "Mark each page as '--- Page N ---'. Return only the text.",
+                "summarize":    "Summarize this document in at most 8 short bullet "
+                                "points covering the main idea of every page, then "
+                                "one sentence on what it is about overall.",
+                "analyze":      "Analyze this document thoroughly.",
+                "translate_hint": "What language is this document in and what does "
+                                  "it say? Summarize it.",
+                "reformat":     "Transcribe this document and reformat it cleanly "
+                                "with proper structure.",
+            }[action]
+            if params.get("instruction"):
+                instruction = params["instruction"]
+            try:
+                result = _pdf_via_gemini(path, instruction)
+            except Exception as e:
+                return (f"This PDF has no text layer (scanned or image-only) and "
+                        f"reading its pages failed: {e}")
+            if not result:
+                return "This PDF has no text layer, and its pages could not be read."
+            if action == "extract_text" or (len(result) > 600 and params.get("save", True)):
+                out = _output_path(path, "text" if action == "extract_text" else action, ".txt")
+                out.write_text(result, encoding="utf-8")
+                head = result if action != "extract_text" else result[:400]
+                return (f"(Scanned PDF — read from the page images.)\n{head[:400]}"
+                        f"{'...' if len(result) > 400 else ''}\n\nFull result saved: {out.name}")
+            return f"(Scanned PDF — read from the page images.)\n{result}"
 
         if action == "extract_text":
             out = _output_path(path, "text", ".txt")
@@ -237,7 +309,14 @@ def _process_pdf(path: Path, action: str, params: dict, speak=None) -> str:
 
     if action == "to_word":
         text = _extract_pdf_text()
-        if not text:
+        if not text.strip():
+            try:
+                text = _pdf_via_gemini(
+                    path, "Transcribe all text in this document. Separate paragraphs "
+                          "with a blank line. Return only the text.")
+            except Exception as e:
+                return f"No text layer, and reading the pages failed: {e}"
+        if not text.strip():
             return "Could not extract text to convert."
         try:
             from docx import Document

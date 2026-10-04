@@ -144,6 +144,17 @@ _LADDERS = {
     SEARCH: ("gemini-2.5-flash", "gemini-3.5-flash", "gemini-2.5-flash-lite",
              "gemini-flash-latest"),
 }
+# Whole documents (a PDF passed as application/pdf). The Live API takes text,
+# images, audio and video but not document parts, so there is no Live rung —
+# REST models read PDFs natively, scanned pages included. Lite models lead:
+# measured on a 6-page scanned lecture PDF, gemini-2.5-flash-lite summarised it
+# in 10 s against 29 s for gemini-2.5-flash, and this runs inside a live voice
+# turn where every second is silence (and long tool calls are a 1011 risk).
+DOCUMENT = "document"
+_LADDERS[DOCUMENT] = ("gemini-2.5-flash-lite", "gemini-3.1-flash-lite",
+                      "gemini-3.5-flash-lite", "gemini-flash-lite-latest",
+                      "gemini-2.5-flash", "gemini-3.5-flash",
+                      "gemini-3.6-flash", "gemini-flash-latest")
 
 # The conversation's own model, and ONE careful fallback behind it.
 #
