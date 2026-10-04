@@ -1183,15 +1183,22 @@ class JarvisLive:
 
         # Real paths, so the model stops inventing them. Without this it filled
         # in "C:\Users\Username\Desktop\..." for a folder the user named, and
-        # open_app was handed a path that never existed.
+        # open_app was handed a path that never existed. The standard folders
+        # come from the shell, not from ~/<Name>: on this kind of machine the
+        # Desktop is often on another drive or in OneDrive, and telling the
+        # model the default made it look in the wrong place with confidence.
+        from core import known_folders as _kf
         _home = Path.home()
+        _f = _kf.all_folders()
         machine_ctx = (
             f"[MACHINE]\n"
             f"User home folder: {_home}\n"
-            f"Desktop: {_home / 'Desktop'}  ·  Downloads: {_home / 'Downloads'}  ·  "
-            f"Documents: {_home / 'Documents'}\n"
-            f"Never invent a path or a placeholder user name. If you do not know "
-            f"where something is, find it with file_controller first.\n\n"
+            f"Desktop: {_f['desktop']}  ·  Downloads: {_f['downloads']}  ·  "
+            f"Documents: {_f['documents']}  ·  Pictures: {_f['pictures']}\n"
+            f"Never invent a path, a folder name or a placeholder user name. For "
+            f"anything inside these folders use file_controller with a shortcut "
+            f"('desktop', 'downloads', …) — list it, or action='find' with part "
+            f"of the name — before naming a path you have not seen.\n\n"
         )
 
         model = LIVE_MODEL
@@ -1469,6 +1476,7 @@ class JarvisLive:
                         except Exception:
                             pass
                     await asyncio.sleep(1.5)
+                    print("[JARVIS] Shut down by voice command.")
                     import os as _os
                     _os._exit(0)
                 asyncio.create_task(_do_shutdown())
@@ -2665,11 +2673,22 @@ class JarvisLive:
             await asyncio.sleep(delay)
 
 def main():
+    # A native crash (Qt, audio driver, …) kills the process without a Python
+    # traceback — on Windows the console simply returns to the prompt, which
+    # looks exactly like closing the window. faulthandler prints where it died.
+    import faulthandler
+    try:
+        faulthandler.enable()
+    except Exception:
+        pass
+
     ui = JarvisUI("face.png")
+    holder: dict = {}
 
     def runner():
         ui.wait_for_api_key()
         jarvis = JarvisLive(ui)
+        holder["jarvis"] = jarvis
         try:
             asyncio.run(jarvis.run())
         except KeyboardInterrupt:
@@ -2677,6 +2696,21 @@ def main():
 
     threading.Thread(target=runner, daemon=True).start()
     ui.root.mainloop()
+
+    # The window is closed. Say so — a log that just stops is indistinguishable
+    # from a crash — and save this conversation's summary before the session
+    # thread dies with the process. Before this, the summary was only written
+    # when a session disconnected, so the conversation you closed the app on
+    # never reached the next morning's briefing.
+    print("[JARVIS] Window closed — shutting down.")
+    jarvis = holder.get("jarvis")
+    loop = getattr(jarvis, "_loop", None)
+    if jarvis is not None and loop is not None and loop.is_running():
+        try:
+            fut = asyncio.run_coroutine_threadsafe(jarvis._save_session_summary(), loop)
+            fut.result(timeout=15)
+        except Exception as e:
+            print(f"[Memory] ⚠️ Could not save the session summary on exit: {e}")
 
 if __name__ == "__main__":
     main()

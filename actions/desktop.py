@@ -29,11 +29,9 @@ def _get_api_key() -> str:
         return json.load(f)["gemini_api_key"]
     
 def _get_desktop() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DESKTOP_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Desktop"
+    # The REAL Desktop — it may have been moved (E:\desktop, OneDrive, …).
+    from core import known_folders
+    return known_folders.desktop()
 
 def _build_sandbox() -> dict:
     import time

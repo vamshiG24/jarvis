@@ -302,15 +302,20 @@ def open_app(
 
     # A file or folder path: open it if it is real, say so if it is not.
     if _looks_like_path(app_name):
+        from core import known_folders
         p = Path(os.path.expandvars(os.path.expanduser(app_name.strip().strip('"'))))
+        # "C:\Users\x\Desktop\thing" when the Desktop really lives elsewhere.
+        p = known_folders.remap_default(p)
         print(f"[open_app] Path requested: {p}")
         if p.exists():
             return (f"Opened {p}." if _open_path(p)
                     else f"Found {p} but could not open it.")
         return (
-            f"Nothing exists at {p}. Do not tell the user it opened. The real home "
-            f"folder is {Path.home()} — never guess a path or a user name. Ask the "
-            f"user where it is, or search for it with file_controller first."
+            f"Nothing exists at {p}. Do not tell the user it opened. The real "
+            f"Desktop is {known_folders.desktop()} and Downloads is "
+            f"{known_folders.downloads()} — never guess a path or a folder name. "
+            f"Find it first with file_controller (action='find' with part of the "
+            f"name, or 'list' on 'desktop'), then open the path it reports."
         )
 
     normalized = _normalize(app_name)

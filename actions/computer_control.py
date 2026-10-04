@@ -57,12 +57,16 @@ def _get_os() -> str:
 def _get_api_key() -> str:
     return _load_config().get("gemini_api_key", "")
 
+from core import known_folders as _kf
+
+# Home plus the real standard folders, which may live on another drive.
 _SAFE_SCREENSHOT_ROOTS = (
     Path.home(),
+    *_kf.all_folders().values(),
 )
 
 def _safe_screenshot_path(requested: str | None) -> Path:
-    fallback = Path.home() / "Desktop" / "jarvis_screenshot.png"
+    fallback = _kf.desktop() / "jarvis_screenshot.png"
     if not requested:
         return fallback
     try:

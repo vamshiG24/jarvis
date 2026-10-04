@@ -43,9 +43,10 @@ MAX_UPLOAD_MB = 500
 
 def _make_uploads_dir() -> Path:
     """Return (and create) the cross-platform uploads folder."""
+    from core import known_folders
     for candidate in [
-        Path.home() / "Downloads" / "JARVIS Uploads",
-        Path.home() / "Documents" / "JARVIS Uploads",
+        known_folders.downloads() / "JARVIS Uploads",   # the REAL Downloads
+        known_folders.documents() / "JARVIS Uploads",
         BASE_DIR / "uploads",
     ]:
         try:

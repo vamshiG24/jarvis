@@ -273,7 +273,8 @@ def _format_text_report(
 def _save_to_desktop(content: str, origin: str, destination: str) -> str:
     ts       = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"flights_{origin}_{destination}_{ts}.txt".replace(" ", "_")
-    desktop  = Path.home() / "Desktop"
+    from core import known_folders
+    desktop  = known_folders.desktop()
     desktop.mkdir(parents=True, exist_ok=True)
     filepath = desktop / filename
 

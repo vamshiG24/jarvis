@@ -1,4 +1,6 @@
+import difflib
 import os
+import re
 import shutil
 import platform
 from pathlib import Path
@@ -11,6 +13,7 @@ except ImportError:
     _SEND2TRASH = False
 
 from core.undo import push_undo
+from core import known_folders
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -90,9 +93,11 @@ def _restore_from_trash(original: Path) -> str:
             f"automatically, but it is there and can be restored by hand.")
 
 
-_SAFE_ROOTS: list[Path] = [
-    Path.home(),
-]
+# The home folder plus wherever the standard folders really live. A Desktop
+# or Downloads folder moved to another drive (E:\desktop, OneDrive, ...) is the
+# user's own space just as much as the home folder is — leaving it out made
+# every file on a relocated Desktop "Access denied".
+_SAFE_ROOTS: list[Path] = [Path.home(), *known_folders.all_folders().values()]
 
 def _is_safe_path(target: Path) -> bool:
     """Is the given path inside _SAFE_ROOTS? If not, reject the operation."""
@@ -106,46 +111,22 @@ def _is_safe_path(target: Path) -> bool:
         return False
 
 def _get_desktop() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DESKTOP_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Desktop"
+    return known_folders.desktop()
 
 def _get_downloads() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DOWNLOAD_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Downloads"
+    return known_folders.downloads()
 
 def _get_documents() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_DOCUMENTS_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Documents"
+    return known_folders.documents()
 
 def _get_pictures() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_PICTURES_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Pictures"
+    return known_folders.pictures()
 
 def _get_music() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_MUSIC_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Music"
+    return known_folders.music()
 
 def _get_videos() -> Path:
-    if _OS == "Linux":
-        xdg = os.environ.get("XDG_VIDEOS_DIR", "")
-        if xdg and Path(xdg).exists():
-            return Path(xdg)
-    return Path.home() / "Videos"
+    return known_folders.videos()
 
 
 def _resolve_path(raw: str) -> Path:
@@ -174,7 +155,52 @@ def _resolve_path(raw: str) -> Path:
         rest = rest.strip("/")
         return shortcuts[head.lower()] / rest if rest else shortcuts[head.lower()]
 
-    return Path(raw).expanduser()
+    # "C:\Users\x\Desktop\notes" when the Desktop really lives elsewhere:
+    # the intent is unambiguous, so follow it to the real folder.
+    return known_folders.remap_default(Path(os.path.expandvars(raw)).expanduser())
+
+
+def _norm(text: str) -> str:
+    """Lower-case and drop separators — 'My_Self' ~ 'my self' ~ 'my-self'."""
+    return re.sub(r"[\s_\-.]+", "", text.lower())
+
+
+def _not_found(target: Path, kind: str = "Path not found") -> str:
+    """'Not found', plus what IS there — so the model can correct itself.
+
+    The model builds paths from what the user said ("my self folder",
+    "Vamsi's pics") and has to guess the spelling. Without a hint it can only
+    guess again; with the nearest real names it gets it right next call."""
+    msg = f"{kind}: {target}"
+    try:
+        parent = target.parent
+        hops = 0
+        while not parent.exists() and parent != parent.parent and hops < 6:
+            parent = parent.parent
+            hops += 1
+        if not parent.is_dir():
+            return msg
+        names = [c.name for c in parent.iterdir() if not c.name.startswith(".")][:400]
+        want = _norm(target.name)
+        by_norm = {_norm(n): n for n in names}
+        close = difflib.get_close_matches(want, list(by_norm), n=5, cutoff=0.45)
+        # Substring hits catch "pics" -> "Vamsi pics 2024", which ratio misses.
+        subs = [by_norm[k] for k in by_norm
+                if want and len(k) > 2 and (want in k or k in want)]
+        picks = list(dict.fromkeys([by_norm[c] for c in close] + subs))[:5]
+        if picks:
+            msg += (f"\nClosest names in {parent}: "
+                    + ", ".join(f"'{n}'" for n in picks)
+                    + ". If one of these is what the user meant, use it.")
+        else:
+            sample = sorted(names, key=str.lower)[:15]
+            if sample:
+                msg += f"\n{parent} contains: " + ", ".join(sample)
+        msg += ("\nDo not guess again — use a name listed here, or "
+                "action='find' with part of the name.")
+    except Exception:
+        pass
+    return msg
 
 def _format_size(b: int) -> str:
     for unit in ["B", "KB", "MB", "GB", "TB"]:
@@ -201,7 +227,7 @@ def list_files(path: str = "desktop", show_hidden: bool = False) -> str:
         if not _is_safe_path(target):
             return f"Access denied: {target}"
         if not target.exists():
-            return f"Path not found: {target}"
+            return _not_found(target)
         if not target.is_dir():
             return f"Not a directory: {target}"
 
@@ -273,7 +299,7 @@ def delete_file(path: str, name: str = "") -> str:
         if not _is_safe_path(target):
             return f"Access denied: {target}"
         if not target.exists():
-            return f"Not found: {target.name}"
+            return _not_found(target, "Not found")
 
         # Safe-directory check — protect critical user folders
         protected = {
@@ -303,7 +329,7 @@ def move_file(path: str, name: str = "", destination: str = "") -> str:
         dst    = _resolve_path(destination) if destination else None
 
         if not src.exists():
-            return f"Source not found: {src.name}"
+            return _not_found(src, "Source not found")
         if dst is None:
             return "No destination specified."
         if not _is_safe_path(src):
@@ -332,7 +358,7 @@ def copy_file(path: str, name: str = "", destination: str = "") -> str:
         dst  = _resolve_path(destination) if destination else None
 
         if not src.exists():
-            return f"Source not found: {src.name}"
+            return _not_found(src, "Source not found")
         if dst is None:
             return "No destination specified."
         if not _is_safe_path(src):
@@ -375,7 +401,7 @@ def rename_file(path: str, name: str = "", new_name: str = "") -> str:
         if not _is_safe_path(target):
             return f"Access denied: {target}"
         if not target.exists():
-            return f"Not found: {target.name}"
+            return _not_found(target, "Not found")
         if not new_name:
             return "No new name provided."
 
@@ -400,7 +426,7 @@ def read_file(path: str, name: str = "", max_chars: int = 4000) -> str:
         if not _is_safe_path(target):
             return f"Access denied: {target}"
         if not target.exists():
-            return f"File not found: {target.name}"
+            return _not_found(target, "File not found")
         if not target.is_file():
             return f"Not a file: {target.name}"
 
@@ -462,18 +488,28 @@ def find_files(name: str = "", extension: str = "",
         results    = []
         dir_count  = 0
         max_dirs   = 500  # performance + safety limit
+        want       = _norm(name) if name else ""
+        ext        = (extension or "").lower()
+        if ext and not ext.startswith("."):
+            ext = "." + ext
 
         for item in search_path.rglob("*"):
             if item.is_dir():
                 dir_count += 1
                 if dir_count > max_dirs:
                     break
+                # Folders match on name too — "find my photos folder" used to
+                # be impossible, because only files were ever compared.
+                if want and not ext and want in _norm(item.name):
+                    results.append(f"📁 {item.name}/ — {item.parent}")
+                    if len(results) >= max_results:
+                        break
                 continue
             if not item.is_file():
                 continue
-            if extension and item.suffix.lower() != extension.lower():
+            if ext and item.suffix.lower() != ext:
                 continue
-            if name and name.lower() not in item.name.lower():
+            if want and want not in _norm(item.name):
                 continue
             size = _format_size(item.stat().st_size)
             results.append(f"📄 {item.name} ({size}) — {item.parent}")
@@ -482,9 +518,9 @@ def find_files(name: str = "", extension: str = "",
 
         if not results:
             query = name or extension or "files"
-            return f"No {query} found in {search_path.name}/"
+            return f"No {query} found in {search_path}"
 
-        return f"Found {len(results)} file(s):\n" + "\n".join(results)
+        return f"Found {len(results)} match(es):\n" + "\n".join(results)
 
     except Exception as e:
         return f"Search error: {e}"
@@ -628,7 +664,7 @@ def get_file_info(path: str, name: str = "") -> str:
         if not _is_safe_path(target):
             return f"Access denied: {target}"
         if not target.exists():
-            return f"Not found: {target.name}"
+            return _not_found(target, "Not found")
 
         stat = target.stat()
         info = {
@@ -734,7 +770,7 @@ TOOL = {
             },
             "path": {
                 "type": "STRING",
-                "description": "File/folder path or shortcut: desktop, downloads, documents, home"
+                "description": "File/folder path or shortcut: desktop, downloads, documents, pictures, music, videos, home. Prefer a shortcut plus sub-path (e.g. 'desktop/My Folder') over a full path you have not seen in a listing."
             },
             "destination": {
                 "type": "STRING",
@@ -750,7 +786,7 @@ TOOL = {
             },
             "name": {
                 "type": "STRING",
-                "description": "File name to search for"
+                "description": "File or folder name (or part of it) to search for with action='find'"
             },
             "extension": {
                 "type": "STRING",
