@@ -25,7 +25,13 @@ else:
 # and it puts a URL carrying the viewer's IP address into a terminal people
 # paste into bug reports. Silenced here, before Qt initialises its logging.
 # An explicit setting from the user is left alone.
-os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.*=false")
+#
+# qt.text.font.db is silenced for the same reason. Every time a line in Telugu,
+# Hindi, Tamil, Bengali … is drawn, Qt walks the font list and prints an
+# "OpenType support missing for <font>, script N" line for each font that cannot
+# shape that script before reaching one that can — nine lines for one sentence,
+# all for text that ends up rendering correctly.
+os.environ.setdefault("QT_LOGGING_RULES", "qt.multimedia.*=false;qt.text.font.db=false")
 
 from PyQt6.QtCore import (
     QEasingCurve, QLineF, QMimeData, QObject, QParallelAnimationGroup, QPointF,
@@ -134,10 +140,24 @@ class C:
 # whatever the machine has instead of to Qt's default serif: Cascadia Code ships
 # with Windows Terminal / Windows 11, Bahnschrift with Windows 10+, and the tail
 # of each list exists everywhere.
+#
+# Script fallbacks go LAST: Qt uses the first family that has a glyph, so a
+# font listed earlier would also take over Latin text. Listing them explicitly
+# means Telugu, Hindi, Tamil, Bengali, Arabic, CJK … always shape properly
+# instead of depending on whatever the system fallback happens to choose.
+_SCRIPT_FALLBACKS = ["Nirmala UI", "Nirmala Text", "Gautami", "Mangal", "Latha",
+                     "Vrinda", "Segoe UI", "Segoe UI Historic", "Microsoft YaHei UI",
+                     "Yu Gothic UI", "Malgun Gothic", "Kohinoor Telugu",
+                     "Telugu Sangam MN", "Noto Sans Telugu", "Noto Sans Devanagari",
+                     "Noto Sans Tamil", "Noto Sans Bengali", "Noto Sans",
+                     "Segoe UI Emoji", "Segoe UI Symbol", "Apple Color Emoji",
+                     "Noto Color Emoji"]
 _MONO_FAMILIES    = ["Cascadia Code", "Cascadia Mono", "JetBrains Mono", "Consolas",
-                     "SF Mono", "Menlo", "DejaVu Sans Mono", "Courier New"]
+                     "SF Mono", "Menlo", "DejaVu Sans Mono", "Courier New",
+                     *_SCRIPT_FALLBACKS]
 _DISPLAY_FAMILIES = ["Bahnschrift", "Segoe UI Variable Display", "Segoe UI",
-                     "SF Pro Display", "Helvetica Neue", "Ubuntu", "Arial"]
+                     "SF Pro Display", "Helvetica Neue", "Ubuntu", "Arial",
+                     *_SCRIPT_FALLBACKS]
 
 
 def _mono(size: float, weight: "QFont.Weight | None" = None) -> QFont:
@@ -4151,84 +4171,10 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _get_desktop_dir() -> Path:
-        """
-        Resolve the user's REAL desktop directory instead of assuming
-        ~/Desktop, which breaks when:
-          • OneDrive "Known Folder Move" relocates the desktop
-            (C:/Users/x/OneDrive/Desktop) — very common on Win 10/11;
-          • the XDG desktop is localized on Linux (~/Masaüstü,
-            ~/Schreibtisch, ~/Bureau, …).
-        Falls back to ~/Desktop only as a last resort.
-        """
-        home = Path.home()
-        _os = platform.system()
-
-        if _os == "Windows":
-            # ── 1) SHGetKnownFolderPath(FOLDERID_Desktop) — the canonical
-            #       answer; follows OneDrive redirection. No dependencies. ──
-            try:
-                import ctypes
-                from ctypes import wintypes
-
-                class _GUID(ctypes.Structure):
-                    _fields_ = [("Data1", wintypes.DWORD),
-                                ("Data2", wintypes.WORD),
-                                ("Data3", wintypes.WORD),
-                                ("Data4", ctypes.c_ubyte * 8)]
-
-                # FOLDERID_Desktop {B4BFCC3A-DB2C-424C-B029-7FE99A87C641}
-                fid = _GUID(0xB4BFCC3A, 0xDB2C, 0x424C,
-                            (ctypes.c_ubyte * 8)(0xB0, 0x29, 0x7F, 0xE9,
-                                                 0x9A, 0x87, 0xC6, 0x41))
-                buf = ctypes.c_wchar_p()
-                if ctypes.windll.shell32.SHGetKnownFolderPath(
-                        ctypes.byref(fid), 0, None, ctypes.byref(buf)) == 0:
-                    p = Path(buf.value)
-                    ctypes.windll.ole32.CoTaskMemFree(buf)
-                    if p.is_dir():
-                        return p
-            except Exception:
-                pass
-
-            # ── 2) Registry: User Shell Folders (may contain %VARS%) ──────
-            try:
-                import winreg
-                with winreg.OpenKey(
-                        winreg.HKEY_CURRENT_USER,
-                        r"Software\Microsoft\Windows\CurrentVersion"
-                        r"\Explorer\User Shell Folders") as key:
-                    val, _t = winreg.QueryValueEx(key, "Desktop")
-                p = Path(os.path.expandvars(val))
-                if p.is_dir():
-                    return p
-            except Exception:
-                pass
-
-        elif _os == "Linux":
-            # ── xdg-user-dir honours localized names (~/Masaüstü, …) ──────
-            try:
-                out = subprocess.run(["xdg-user-dir", "DESKTOP"],
-                                     capture_output=True, text=True, timeout=5)
-                p = Path(out.stdout.strip())
-                if out.stdout.strip() and p != home and p.is_dir():
-                    return p
-            except Exception:
-                pass
-            try:
-                cfg = home / ".config" / "user-dirs.dirs"
-                for line in cfg.read_text(encoding="utf-8").splitlines():
-                    line = line.strip()
-                    if line.startswith("XDG_DESKTOP_DIR"):
-                        val = line.split("=", 1)[1].strip().strip('"')
-                        p = Path(val.replace("$HOME", str(home)))
-                        if p != home and p.is_dir():
-                            return p
-            except Exception:
-                pass
-
-        # macOS: ~/Desktop is always the real path (localization is
-        # display-only). Everything else lands here as a last resort.
-        return home / "Desktop"
+        """The user's REAL desktop (OneDrive / moved / localized), resolved by
+        core.known_folders — shared with every action that saves to it."""
+        from core import known_folders
+        return known_folders.desktop()
 
     def _create_desktop_shortcut(self):
         """
@@ -6204,6 +6150,18 @@ class _RootShim:
     def __init__(self, app: QApplication):
         self._app = app
     def mainloop(self):
+        # Ctrl+C in the terminal closes the app properly. Qt's event loop never
+        # hands control back to Python, so SIGINT was ignored until the next
+        # Python bytecode ran — i.e. never; a short no-op timer gives the
+        # interpreter a chance to run the handler.
+        import signal
+        try:
+            signal.signal(signal.SIGINT, lambda *_: self._app.quit())
+            self._sig_tick = QTimer()
+            self._sig_tick.timeout.connect(lambda: None)
+            self._sig_tick.start(300)
+        except Exception:
+            pass
         self._app.exec()
     def protocol(self, *_):
         pass

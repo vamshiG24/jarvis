@@ -146,9 +146,12 @@ def _transport_works(idx: int, kind: str, api_key) -> bool:
             st.stop(); st.close()
             ok = elapsed > secs * 0.5
             if not ok:
-                print(f"[Audio] output: host API reports success but moves no "
-                      f"audio ({elapsed*1000:.0f} ms for {secs*1000:.0f} ms) "
-                      f"— skipping it")
+                # Informational, not an error: this is the probe doing its job
+                # (DirectSound output on Windows is the usual silent sink).
+                _api = (api_key[0] if isinstance(api_key, tuple) else api_key) or "default"
+                print(f"[Audio] output: {_api} accepts audio but never plays it "
+                      f"({elapsed*1000:.0f} ms for {secs*1000:.0f} ms) — trying "
+                      f"the next backend (expected on Windows, not an error)")
         else:
             # main.py reads through a callback — count what arrives.
             frames = [0]
@@ -163,8 +166,9 @@ def _transport_works(idx: int, kind: str, api_key) -> bool:
             st.stop(); st.close()
             ok = frames[0] > rate * secs * 0.3
             if not ok:
-                print(f"[Audio] input: host API delivered {frames[0]} frames in "
-                      f"{secs*1000:.0f} ms — skipping it")
+                _api = (api_key[0] if isinstance(api_key, tuple) else api_key) or "default"
+                print(f"[Audio] input: {_api} delivered only {frames[0]} frames in "
+                      f"{secs*1000:.0f} ms — trying the next backend")
     except Exception as e:
         print(f"[Audio] {kind} transport probe failed: {e}")
         ok = False
