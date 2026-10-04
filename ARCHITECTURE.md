@@ -314,6 +314,7 @@ flowchart LR
         HK["hotkey.py"]
         UNDO["undo.py"]
         CONF["confirm.py"]
+        KF["known_folders.py — real Desktop / Downloads"]
         PROMPT["prompt.txt"]
     end
     subgraph MEMPKG["memory/"]

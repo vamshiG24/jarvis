@@ -65,6 +65,11 @@ Nexus sphere renders in about 5 ms per frame, and idle repaint stays at around 2
 * **`JarvisUI.glance()` never worked.** It referenced an attribute that didn't exist. Fixed.
 * **Quota exhaustion delivered as a 1011** ("Resource has been exhausted") is now recognised, so the app steps down the model ladder.
 * **A bare 1007 no longer counts as "invalid API key".** That reopened the setup screen when the real cause was an unsupported field.
+* **Moved Desktop / Downloads folders are respected.** About 15 places assumed `C:\Users\<you>\Desktop`. On machines where Windows or OneDrive has moved these folders (for example `E:\desktop`), "list my downloads" showed the wrong folder, saved files landed somewhere you never look, and the real Desktop was "Access denied". A new `core/known_folders.py` asks the Windows shell (or XDG on Linux) where the folders really are, and the whole app uses it.
+* **Folder lookups recover instead of dead-ending.** A path built on the default layout is remapped to the real folder automatically. A miss now returns the closest real names ("did you mean …"), and `find` matches folders as well as files.
+* **Scanned and image-only PDFs can be read.** Lecture slides exported as pictures used to stop at "may be scanned". The PDF is now sent to Gemini, which reads the page images (OCR included); this takes about 8–10 s for a 6-page lecture.
+* **Telugu, Hindi, Tamil, Bengali and other scripts render properly**, and the console no longer fills with `qt.text.font.db: OpenType support missing…` lines.
+* **Closing the window is no longer silent.** It prints `Window closed`, saves the conversation summary that used to be lost, and `faulthandler` reports a real crash if one ever happens. Ctrl+C in the terminal now closes the app properly.
 
 ---
 
@@ -155,7 +160,9 @@ These are the advanced keys:
 | `⚠ Gemini closed the session with 1011 …` | A Google-side error | None. The app reconnects with your conversation kept. If it repeats constantly, the service may be having an outage |
 | Header chip shows `RECOVERING` | Reconnecting after a server or quota error | Wait a few seconds |
 | `Resumption handle rejected` | The old session couldn't be resumed | None. It continues in a fresh session seeded from the transcript |
-| `[Audio] output: host API reports success but moves no audio … skipping it` | The startup probe found a silent audio backend (usually DirectSound output) and skipped it | None. This is expected; it picks a working one (MME) |
+| `[Audio] output: directsound accepts audio but never plays it …` | The startup probe found a silent audio backend and skipped it | None. This is expected on Windows; it picks a working one (MME) |
+| Log ends without `Window closed` | The process died instead of being closed | Copy the `Fatal Python error` / traceback that `faulthandler` printed into a bug report |
+| `[Gemini] …: ReadError … forcibly closed by the remote host` | The network dropped a request | None. The ladder retries on the next model. If it happens often, check your network or VPN |
 | `FutureWarning: The pynvml package is deprecated` | An old install still has `pynvml` | `pip uninstall -y pynvml` |
 | `API key invalid` and the setup screen reopens | Wrong or revoked key | Paste a valid key |
 
