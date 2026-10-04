@@ -3,14 +3,23 @@
 # none of it present boots straight to the setup screen, which is the intended
 # first experience — so nothing here needs to be committed, and some of it must
 # never be.
+#
+# NOTE: git only treats `#` as a comment at the START of a line. A trailing
+# "pattern   # comment" becomes part of the pattern and silently matches
+# nothing — which is how config/api_keys.json and the TLS key used to show up
+# as untracked files. Keep every comment on its own line.
 
 # ── Secrets. Committing any of these publishes them. ──────────────────────────
-config/api_keys.json          # your Gemini API key, plus per-plugin credentials
-config/certs/                 # the dashboard's TLS private key and certificate
-config/whatsapp_web/          # a LINKED WhatsApp session — committing it hands
-                              # somebody your WhatsApp account, not just a key
-**/token*.json                # Google OAuth tokens (Gmail / Calendar plugins)
-**/client_secret*.json        # Google OAuth client secrets
+# Your Gemini API key, plus per-plugin credentials
+config/api_keys.json
+# The dashboard's TLS private key and certificate
+config/certs/
+# A LINKED WhatsApp session — committing it hands somebody your WhatsApp
+# account, not just a key
+config/whatsapp_web/
+# Google OAuth tokens and client secrets (Gmail / Calendar plugins)
+**/token*.json
+**/client_secret*.json
 *credentials*.json
 .env
 .env.*
