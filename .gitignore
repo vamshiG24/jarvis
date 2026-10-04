@@ -57,3 +57,6 @@ desktop.ini
 logs/
 downloads/
 screenshots/
+
+# Fallback location for phone uploads when Downloads is not writable
+uploads/

@@ -41,23 +41,18 @@ PORT        = 8000
 MAX_UPLOAD_MB = 500
 
 
-def _make_uploads_dir() -> Path:
-    """Return (and create) the cross-platform uploads folder."""
+def _uploads_dir_path() -> Path:
+    """Where files sent from the phone are saved — the path only.
+
+    Deliberately NOT created here. This ran at import, so every launch made an
+    empty "JARVIS Uploads" folder in the user's Downloads whether or not they
+    ever used phone upload. It is now created by the upload handler, on the
+    first file that actually arrives."""
     from core import known_folders
-    for candidate in [
-        known_folders.downloads() / "JARVIS Uploads",   # the REAL Downloads
-        known_folders.documents() / "JARVIS Uploads",
-        BASE_DIR / "uploads",
-    ]:
-        try:
-            candidate.mkdir(parents=True, exist_ok=True)
-            return candidate
-        except Exception:
-            pass
-    return BASE_DIR / "uploads"
+    return known_folders.downloads() / "JARVIS Uploads"   # the REAL Downloads
 
 
-UPLOADS_DIR = _make_uploads_dir()
+UPLOADS_DIR = _uploads_dir_path()
 
 def _get_gemini_key() -> str | None:
     try:
@@ -732,6 +727,13 @@ class DashboardServer:
             async def upload_file(req: Request, file: UploadFile = FastAPIFile(...)):
                 if not _auth(req):
                     return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+                # Created on the first real upload, never at startup.
+                try:
+                    self._uploads_dir.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    self._uploads_dir = BASE_DIR / "uploads"
+                    self._uploads_dir.mkdir(parents=True, exist_ok=True)
 
                 safe = _safe_filename(file.filename or "upload")
                 dest = self._uploads_dir / safe
