@@ -1233,8 +1233,11 @@ class JarvisLive:
         _body = {
             "face": "the animated head in the centre of the window is your face",
             "core": "the reactor core in the centre of the window is your body",
-        }.get(_style, "the holographic sphere in the centre of the window — it "
-                      "pulses with your voice — is your body")
+            "nexus": "the holographic sphere in the centre of the window — it "
+                     "pulses with your voice — is your body",
+        }.get(_style, "the 3D holographic projection in the centre of the window "
+                      "— an arc-reactor core inside turning rings, above a "
+                      "projection table — is your body; it pulses with your voice")
         sys_prompt = _render_prompt(sys_prompt, {
             "assistant_name": self._asst_name,
             "body": _body,

@@ -99,8 +99,8 @@ APP_ORIGINAL_AUTHOR = "FatihMakes"
 
 _DEFAULT_W, _DEFAULT_H = 1180, 760
 _MIN_W,     _MIN_H     = 900, 600
-_LEFT_W  = 176
-_RIGHT_W = 352
+_LEFT_W  = 200
+_RIGHT_W = 366
 
 _OS = platform.system()  # "Windows" | "Darwin" | "Linux"
 
@@ -133,6 +133,10 @@ class C:
     # Fixed accents (not hue-linked): depth and highlights in the Nexus HUD.
     VIOLET    = "#9d7bff"
     MAGENTA   = "#ff4fd8"
+    # Stark HUD: Iron Man gold for thinking/alerts, and the deep blue the
+    # projection light falls off into.
+    GOLD      = "#ffb627"
+    DEEP      = "#0a2a6e"
 
 
 # ── Typography ────────────────────────────────────────────────────────────────
@@ -335,6 +339,8 @@ class _SysMetrics:
         self.net  = 0.0   
         self.gpu  = -1.0  
         self.tmp  = -1.0  
+        self.bat  = None    # (percent, plugged, secs_left) or None on a desktop
+        self.disk = -1.0    # system drive usage %
         self._lock = threading.Lock()
         self._last_net = psutil.net_io_counters()
         self._last_net_t = time.time()
@@ -386,6 +392,15 @@ class _SysMetrics:
         else:
             gpu = self.gpu
             tmp = self.tmp
+        try:
+            b = psutil.sensors_battery()
+            bat = (b.percent, b.power_plugged, b.secsleft) if b is not None else None
+        except Exception:
+            bat = None
+        try:
+            disk = psutil.disk_usage(os.path.abspath(os.sep)).percent
+        except Exception:
+            disk = -1.0
 
         with self._lock:
             self.cpu = cpu
@@ -393,6 +408,8 @@ class _SysMetrics:
             self.net = net
             self.gpu = gpu
             self.tmp = tmp
+            self.bat = bat
+            self.disk = disk
 
     def _get_gpu(self) -> float:
         # pynvml — subprocess-free; initialise once and reuse the handle.
@@ -477,6 +494,8 @@ class _SysMetrics:
                 "net": self.net,
                 "gpu": self.gpu,
                 "tmp": self.tmp,
+                "bat": self.bat,
+                "disk": self.disk,
             }
 
 
@@ -540,6 +559,20 @@ class HudCanvas(QWidget):
         self.link_state  = "CONNECTING"
         self.link_detail = ""
         self.session_t0  = 0.0
+
+        # ── Stark (3D) state ─────────────────────────────────────────────────
+        # The canvas now sits behind the WHOLE window, so every style draws
+        # into the "core area" between the side panels. The window provides
+        # it (area_provider); None means "the whole canvas".
+        self.area_provider = None
+        self._stark = None
+        try:
+            from core.hud3d import StarkScene
+            self._stark = StarkScene()
+        except Exception as _e:              # pragma: no cover — cosmetic only
+            print(f"[HUD] Stark scene unavailable ({_e}) — using Nexus.")
+            if self.hud_style == "stark":
+                self.hud_style = "nexus"
 
         self._tick       = 0
         self._scale      = 1.0
@@ -717,6 +750,10 @@ class HudCanvas(QWidget):
         # starts talking. Same lesson the head's sway taught.
         self._core_phase += min(0.10, max(0.0, dt))
 
+        if self._stark is not None and self.hud_style == "stark":
+            self._stark.step(dt, amp, self.state, self.speaking, self.muted,
+                             self._mouse_lean())
+
         if self._avatar is not None and self.hud_style == "face":
             self._avatar.step(dt, amp, speaking=self.speaking,
                               muted=self.muted, state=self.state,
@@ -767,17 +804,76 @@ class HudCanvas(QWidget):
         self._paint_tick = (self._paint_tick + 1) % 6
         active = (self.speaking or amp > 0.02
                   or self.state in ("THINKING", "PROCESSING")
-                  # Nexus assembles itself on boot — full rate for that, then
-                  # back to the idle rate like the other styles.
-                  or (self.hud_style == "nexus" and now - self._boot_t0 < 2.0))
-        if _blinked or (self._paint_tick % 2 == 0 if active
-                        else self._paint_tick % 3 == 0):
+                  # Nexus and Stark assemble themselves on boot — full rate
+                  # for that, then back to the idle rate like the others.
+                  or (self.hud_style in ("nexus", "stark") and now - self._boot_t0 < 4.8))
+        # In the background — another app focused — idle drops to ~10 Hz. The
+        # HUD is mostly running behind other windows all day, and a 3D scene
+        # at 20 Hz behind a code editor is CPU nobody is looking at. Speaking,
+        # thinking and booting keep their full rate.
+        try:
+            focused = self.window().isActiveWindow()
+        except Exception:
+            focused = True
+        if active:
+            due = self._paint_tick % 2 == 0          # ~30 Hz
+        elif focused:
+            due = self._paint_tick % 3 == 0          # ~20 Hz
+        else:
+            due = self._paint_tick == 0              # ~10 Hz
+        if _blinked or due:
             # Nothing is on screen when the window is hidden or minimised, so
             # rendering the avatar into it is pure waste — and this app is meant
             # to sit running all day. The animation state above keeps stepping,
             # so it picks up mid-motion instead of snapping when you come back.
             if self._on_screen():
                 self.update()
+
+    def core_area(self) -> QRectF:
+        """Where the centrepiece goes, in canvas coordinates."""
+        full = QRectF(self.rect())
+        try:
+            if self.area_provider is not None:
+                r = self.area_provider()
+                if r is not None and r.width() > 80 and r.height() > 80:
+                    return r
+        except Exception:
+            pass
+        return full
+
+    def _mouse_lean(self) -> tuple[float, float]:
+        """Cursor position relative to the core, -1..1 — the camera leans
+        toward it. Read from QCursor because the canvas sits behind the other
+        widgets and never receives mouse events itself."""
+        try:
+            from PyQt6.QtGui import QCursor
+            pos = self.mapFromGlobal(QCursor.pos())
+            a = self.core_area()
+            mx = (pos.x() - a.center().x()) / max(1.0, a.width() / 2)
+            my = (pos.y() - a.center().y()) / max(1.0, a.height() / 2)
+            return (max(-1.0, min(1.0, mx)), max(-1.0, min(1.0, my)))
+        except Exception:
+            return (0.0, 0.0)
+
+    def _stark_palette(self) -> dict:
+        """State → colours for the 3D scene."""
+        thinking = self.state in ("THINKING", "PROCESSING", "CONNECTING")
+        link = (self.link_state or "").upper()
+        if self.muted:
+            pri = acc = gold = qcol(C.MUTED_C)
+        else:
+            pri = qcol(C.PRI_DIM) if self.state == "SLEEPING" else qcol(C.PRI)
+            if self.speaking:
+                acc = qcol(C.WHITE)
+            elif thinking or link == "RECOVERING":
+                acc = qcol(C.GOLD)
+            else:
+                acc = qcol(C.TEXT)
+            gold = qcol(C.GOLD)
+        return dict(pri=pri, acc=acc, gold=gold, dim=qcol(C.BORDER_B),
+                    white=qcol(C.WHITE), bg=qcol(C.BG), deep=qcol(C.DEEP),
+                    red=qcol(C.RED), thinking=thinking and not self.muted,
+                    speaking=self.speaking and not self.muted)
 
     def _on_screen(self) -> bool:
         """True only when this canvas can actually be seen by the user."""
@@ -1234,71 +1330,11 @@ class HudCanvas(QWidget):
         state = "MUTED" if self.muted else ("SPEAKING" if self.speaking else self.state)
         block(W - m - 8 - 220, H - m - 36, "CORE STATE", state, main, Rt)
 
-    def paintEvent(self, _):
-        p = QPainter(self)
-        if not p.isActive():      # device not ready (e.g. 0-size during layout) — skip cleanly
-            return
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.fillRect(self.rect(), qcol(C.BG))
-
-        W, H = self.width(), self.height()
-        cx, cy = W / 2, H / 2
-        fw = min(W, H)
-
-        # Backdrop — blitted from a cached layer; rebuilt only when the size
-        # or the theme colour changes (so live re-theming still works). Nexus
-        # gets the hex lattice, the other two keep the original dot grid.
-        if self.hud_style == "nexus":
-            _hkey = (W, H, C.PRI)
-            if self._hex_cache is None or self._hex_key != _hkey:
-                self._hex_cache = self._hex_layer(W, H)
-                self._hex_key   = _hkey
-            p.drawPixmap(0, 0, self._hex_cache)
-        else:
-            _gkey = (W, H, C.PRI_GHO)
-            if self._grid_cache is None or self._grid_key != _gkey:
-                self._grid_cache = self._make_grid(W, H)
-                self._grid_key   = _gkey
-            p.drawPixmap(0, 0, self._grid_cache)
-
-        # ── holographic head ────────────────────────────────────────────────
-        # Sized to the band between the top of the canvas and the status line,
-        # capped by width, so it fills the HUD at any window size — including
-        # fullscreen — without ever colliding with the status text below.
-        _sy_status = cy + fw * 0.40
-        if self._avatar is not None and self.hud_style == "face":
-            _band_t = 12.0
-            _band_h = max(60.0, _sy_status - 12.0 - _band_t)
-            _r_head = min(fw * 0.355, _band_h / (self._avatar.SPAN + 0.08))
-            _head_cy = _band_t + (_band_h - self._avatar.SPAN * _r_head) / 2.0 + _r_head
-
-            if self.muted:
-                _main = _acc = qcol(C.MUTED_C)
-            else:
-                _main = qcol(C.PRI)
-                if self.speaking:
-                    _acc = qcol(C.ACC)
-                elif self.state in ("THINKING", "PROCESSING"):
-                    _acc = qcol(C.ACC2)
-                elif self.state == "LISTENING":
-                    _acc = qcol(C.GREEN)
-                else:
-                    _acc = qcol(C.PRI)
-            self._avatar.paint(p, cx, _head_cy, _r_head, _main, _acc, qcol(C.BG))
-
-        # Nexus (default) and the reactor core share the same band; the core
-        # is also the fallback if the head could not be built.
-        else:
-            _band_t = 12.0
-            _band_h = max(60.0, _sy_status - 12.0 - _band_t)
-            _r = min(W * 0.46, _band_h / 2.0)
-            if self.hud_style == "nexus":
-                self._paint_nexus(p, cx, _band_t + _band_h / 2.0, _r, W, H)
-            else:
-                self._paint_core(p, cx, _band_t + _band_h / 2.0, _r, W, _band_h)
-
+    def _paint_status(self, p: QPainter, W: float, sy_status: float) -> None:
+        """Status pill and waveform, centred in a band W wide at sy_status."""
         # ── Status pill ──────────────────────────────────────────────────────
-        sy = _sy_status
+        sy = sy_status
+        cx = W / 2
         if self.muted:
             txt, col = "⊘  MUTED",     qcol(C.MUTED_C)
         elif self.speaking:
@@ -1355,6 +1391,95 @@ class HudCanvas(QWidget):
             p.drawRoundedRect(QRectF(wx0 + i * bw, wy - hgt, bw - 2.5, hgt * 2), 1.5, 1.5)
         p.setBrush(Qt.BrushStyle.NoBrush)
 
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        if not p.isActive():      # device not ready (e.g. 0-size during layout) — skip cleanly
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        full = QRectF(self.rect())
+        area = self.core_area()
+
+        # ── Stark: the 3D scene owns the whole canvas ───────────────────────
+        if self.hud_style == "stark" and self._stark is not None:
+            try:
+                snap = _metrics.snapshot()
+                self._stark.paint(p, full, area, self._stark_palette(),
+                                  _title_text(self._assistant_name or "JARVIS"), snap)
+            except Exception as e:                     # never kill the HUD
+                p.fillRect(full, qcol(C.BG))
+                print(f"[HUD] Stark paint failed: {e}")
+            p.translate(area.topLeft())
+            W, H = area.width(), area.height()
+            self._paint_telemetry(p, W, H, qcol(C.PRI))
+            # The boot sequence carries its own status line.
+            if not self._stark.booting():
+                self._paint_status(p, W, H - 78)
+            p.end()
+            return
+
+        # Every other style draws into the core area, exactly as it used to
+        # draw into a canvas of that size.
+        p.fillRect(full, qcol(C.BG))
+        p.translate(area.topLeft())
+        W, H = int(area.width()), int(area.height())
+        cx, cy = W / 2, H / 2
+        fw = min(W, H)
+
+        # Backdrop — blitted from a cached layer; rebuilt only when the size
+        # or the theme colour changes (so live re-theming still works). Nexus
+        # gets the hex lattice, the other two keep the original dot grid.
+        if self.hud_style == "nexus":
+            _hkey = (W, H, C.PRI)
+            if self._hex_cache is None or self._hex_key != _hkey:
+                self._hex_cache = self._hex_layer(W, H)
+                self._hex_key   = _hkey
+            p.drawPixmap(0, 0, self._hex_cache)
+        else:
+            _gkey = (W, H, C.PRI_GHO)
+            if self._grid_cache is None or self._grid_key != _gkey:
+                self._grid_cache = self._make_grid(W, H)
+                self._grid_key   = _gkey
+            p.drawPixmap(0, 0, self._grid_cache)
+
+        # ── holographic head ────────────────────────────────────────────────
+        # Sized to the band between the top of the canvas and the status line,
+        # capped by width, so it fills the HUD at any window size — including
+        # fullscreen — without ever colliding with the status text below.
+        _sy_status = cy + fw * 0.40
+        if self._avatar is not None and self.hud_style == "face":
+            _band_t = 12.0
+            _band_h = max(60.0, _sy_status - 12.0 - _band_t)
+            _r_head = min(fw * 0.355, _band_h / (self._avatar.SPAN + 0.08))
+            _head_cy = _band_t + (_band_h - self._avatar.SPAN * _r_head) / 2.0 + _r_head
+
+            if self.muted:
+                _main = _acc = qcol(C.MUTED_C)
+            else:
+                _main = qcol(C.PRI)
+                if self.speaking:
+                    _acc = qcol(C.ACC)
+                elif self.state in ("THINKING", "PROCESSING"):
+                    _acc = qcol(C.ACC2)
+                elif self.state == "LISTENING":
+                    _acc = qcol(C.GREEN)
+                else:
+                    _acc = qcol(C.PRI)
+            self._avatar.paint(p, cx, _head_cy, _r_head, _main, _acc, qcol(C.BG))
+
+        # Nexus (default) and the reactor core share the same band; the core
+        # is also the fallback if the head could not be built.
+        else:
+            _band_t = 12.0
+            _band_h = max(60.0, _sy_status - 12.0 - _band_t)
+            _r = min(W * 0.46, _band_h / 2.0)
+            if self.hud_style == "nexus":
+                self._paint_nexus(p, cx, _band_t + _band_h / 2.0, _r, W, H)
+            else:
+                self._paint_core(p, cx, _band_t + _band_h / 2.0, _r, W, _band_h)
+
+        self._paint_status(p, W, _sy_status)
+
         p.end()   # end deterministically so the backing store never flushes an active painter
 
 _HEADER_H = 60
@@ -1368,6 +1493,7 @@ class _ScanLine(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setFixedHeight(2)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self._x = 0.0
         self._t = QTimer(self)
         self._t.timeout.connect(self._tick)
@@ -1393,16 +1519,186 @@ class _ScanLine(QWidget):
         p.end()
 
 
+def _is_jarvis(name: str) -> bool:
+    return name.replace(".", "").replace(" ", "").upper() == "JARVIS"
+
+
+def _title_text(name: str) -> str:
+    """The film's own spelling when the assistant is called JARVIS."""
+    return "J.A.R.V.I.S." if _is_jarvis(name) else name.upper()
+
+
+def _subtitle_text(name: str) -> str:
+    return ("JUST A RATHER VERY INTELLIGENT SYSTEM" if _is_jarvis(name)
+            else "PERSONAL AI ASSISTANT")
+
+
+class HoloPanel(QFrame):
+    """A floating holographic panel — chamfered corners, glowing edges, a
+    title tab — in the style of the suit's HUD read-outs.
+
+    Opaque on purpose. The 3D scene behind it repaints 20-30 times a second,
+    and Qt skips everything under an opaque widget when it does; a
+    translucent panel would drag a log view and a dozen buttons through every
+    one of those frames. The look is painted once into a cached pixmap and
+    rebuilt only when the size or the theme changes.
+    """
+
+    def __init__(self, title: str, parent=None, cut: int = 18, top: int = 34):
+        super().__init__(parent)
+        self._title = title
+        self._cut = cut
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+        self._cache: QPixmap | None = None
+        self._cache_key = None
+        self.setContentsMargins(12, top, 12, 12)
+
+    def _render(self, W: int, H: int) -> QPixmap:
+        pm = QPixmap(max(1, W), max(1, H))
+        pm.fill(qcol(C.BG))
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c = self._cut
+        shape = QPolygonF([QPointF(c, 0.5), QPointF(W - 0.5, 0.5),
+                           QPointF(W - 0.5, H - c), QPointF(W - c, H - 0.5),
+                           QPointF(0.5, H - 0.5), QPointF(0.5, c)])
+        g = QLinearGradient(0, 0, 0, H)
+        g.setColorAt(0.0, qcol(C.PANEL2))
+        g.setColorAt(1.0, qcol(C.DARK))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(g))
+        p.drawPolygon(shape)
+        # Faint scanlines — the hologram texture.
+        path = QPainterPath()
+        path.addPolygon(shape)
+        p.setClipPath(path)
+        p.setPen(QPen(qcol(C.PRI, 9), 1))
+        for y in range(0, H, 3):
+            p.drawLine(0, y, W, y)
+        p.setClipping(False)
+        # Edge + glow.
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(qcol(C.PRI, 34), 4))
+        p.drawPolygon(shape)
+        p.setPen(QPen(qcol(C.BORDER_B), 1))
+        p.drawPolygon(shape)
+        # Bright accents on the chamfers and along the top edge.
+        p.setPen(QPen(qcol(C.PRI, 230), 2))
+        p.drawLine(QPointF(0.5, c), QPointF(c, 0.5))
+        p.drawLine(QPointF(W - c, H - 0.5), QPointF(W - 0.5, H - c))
+        p.drawLine(QPointF(c, 0.5), QPointF(c + 70, 0.5))
+        p.drawLine(QPointF(W - 0.5, H - c), QPointF(W - 0.5, H - c - 40))
+        # Corner ticks.
+        p.setPen(QPen(qcol(C.PRI, 150), 1.4))
+        p.drawLine(QPointF(W - 14, 5), QPointF(W - 5, 5))
+        p.drawLine(QPointF(W - 5, 5), QPointF(W - 5, 14))
+        p.drawLine(QPointF(5, H - 14), QPointF(5, H - 5))
+        p.drawLine(QPointF(5, H - 5), QPointF(14, H - 5))
+        # Title tab.
+        if self._title:
+            f = _display(8, QFont.Weight.Bold, spacing=2.6)
+            p.setFont(f)
+            tw = p.fontMetrics().horizontalAdvance(self._title)
+            p.setPen(QPen(qcol(C.PRI), 1))
+            p.drawText(QRectF(c + 8, 7, tw + 4, 16),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, self._title)
+            p.setPen(QPen(qcol(C.BORDER_B), 1))
+            p.drawLine(QPointF(c + 8, 26), QPointF(W - 12, 26))
+            # Little status blocks after the title — pure HUD flavour.
+            x = c + 8 + tw + 12
+            for k in range(3):
+                p.fillRect(QRectF(x + k * 7, 12, 4, 7), qcol(C.PRI, 200 - k * 60))
+        p.end()
+        return pm
+
+    def paintEvent(self, _):
+        W, H = self.width(), self.height()
+        key = (W, H, C.PRI, C.PANEL2, C.DARK, C.BORDER_B, C.BG, self._title)
+        if self._cache is None or self._cache_key != key:
+            self._cache = self._render(W, H)
+            self._cache_key = key
+        p = QPainter(self)
+        if p.isActive():
+            p.drawPixmap(0, 0, self._cache)
+            p.end()
+
+
+class _OpaqueBar(QWidget):
+    """A header/footer strip that paints its own dark gradient and is OPAQUE.
+
+    Measured: while these were translucent, every frame of the 3D scene made
+    Qt repaint all their labels and buttons too — fifteen widgets, twenty to
+    thirty times a second, to redraw a clock that changes once a second. An
+    opaque bar is skipped by the scene's repaints entirely."""
+
+    def __init__(self, parent=None, flip: bool = False):
+        super().__init__(parent)
+        self._flip = flip
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        if not p.isActive():
+            return
+        g = QLinearGradient(0, 0, 0, self.height())
+        a, b = qcol(C.BG), qcol(C.DARK)
+        g.setColorAt(0.0, b if self._flip else a)
+        g.setColorAt(1.0, a if self._flip else b)
+        p.fillRect(self.rect(), QBrush(g))
+        p.end()
+
+
+class _DragBar(_OpaqueBar):
+    """The header doubles as the title bar of the frameless window: drag to
+    move (with the OS's own snapping, via startSystemMove), double-click to
+    maximise or restore."""
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            wh = self.window().windowHandle()
+            try:
+                if wh is not None and wh.startSystemMove():
+                    e.accept()
+                    return
+            except Exception:
+                pass
+        super().mousePressEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        w = self.window()
+        if w.isFullScreen():
+            return
+        w.showNormal() if w.isMaximized() else w.showMaximized()
+
+
+def _window_button(text: str, tip: str, danger: bool = False) -> QPushButton:
+    b = QPushButton(text)
+    b.setFixedSize(34, 26)
+    b.setFont(_display(10, QFont.Weight.Bold))
+    b.setCursor(Qt.CursorShape.PointingHandCursor)
+    b.setToolTip(tip)
+    hover_bg = "#3a0a14" if danger else C.PRI_GHO
+    hover_fg = C.RED if danger else C.PRI
+    b.setStyleSheet(f"""
+        QPushButton {{ background: transparent; color: {C.TEXT_MED};
+                       border: 1px solid {C.BORDER}; border-radius: 6px; }}
+        QPushButton:hover {{ background: {hover_bg}; color: {hover_fg};
+                             border-color: {hover_fg}; }}
+    """)
+    return b
+
+
 class MetricBar(QWidget):
     """A telemetry tile: label, live value, a sparkline of the last minute and
     a gradient level bar. The API is unchanged — set_value(pct, text)."""
 
     _HIST = 32          # samples kept for the sparkline (~1 min at 2 s/poll)
 
-    def __init__(self, label: str, color: str = C.PRI, parent=None):
+    def __init__(self, label: str, color: str = C.PRI, parent=None, invert: bool = False):
         super().__init__(parent)
         self._label = label
         self._color = color
+        self._invert = invert   # True where LOW is bad (battery)
         self._value = 0.0       # 0–100
         self._text  = "--"
         self._hist: list[float] = []
@@ -1435,9 +1731,10 @@ class MetricBar(QWidget):
         p.setPen(QPen(qcol(C.BORDER_A), 1))
         p.drawRoundedRect(QRectF(0.5, 0.5, W - 1, H - 1), 6, 6)
 
-        if self._value > 85:
+        sev = 100.0 - self._value if self._invert else self._value
+        if sev > 85:
             bar_col = qcol(C.RED)
-        elif self._value > 65:
+        elif sev > 65:
             bar_col = qcol(C.ACC)
         else:
             bar_col = qcol(self._color)
@@ -3529,9 +3826,23 @@ class MainWindow(QMainWindow):
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
 
+        # No OS title bar: the HUD runs edge to edge, the header is the drag
+        # bar (_DragBar), and the window controls live in it.
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.FramelessWindowHint)
+
         central = QWidget()
-        central.setStyleSheet(f"background: {C.BG};")
+        central.setObjectName("Central")
+        # Scoped to the central widget ONLY. The old unscoped "background:"
+        # cascaded a solid fill into every child widget, which is why nothing
+        # could ever be seen behind the panels.
+        central.setStyleSheet(f"QWidget#Central {{ background: {C.BG}; }}")
         self.setCentralWidget(central)
+
+        # The HUD is the window's backdrop: one canvas behind everything,
+        # sized to the whole window in resizeEvent. The 3D scene fills it and
+        # the panels float on top.
+        self.hud = HudCanvas(face_path, _display, parent=central)
+        self.hud.lower()
 
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
@@ -3539,15 +3850,13 @@ class MainWindow(QMainWindow):
         root.addWidget(self._build_header())
 
         body = QHBoxLayout()
-        body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(0)
+        body.setContentsMargins(14, 10, 14, 6)
+        body.setSpacing(14)
 
         self._left_panel = self._build_left_panel()
         body.addWidget(self._left_panel, stretch=0)
 
-        # Center column: HUD + resizable content panel via QSplitter
-        self.hud = HudCanvas(face_path, _display)
-        self.hud.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # Center column: HUD window + resizable content panel via QSplitter
         self._content_panel = self._build_content_panel()
         self._quiz_panel = self._build_quiz_panel()
 
@@ -3703,10 +4012,14 @@ class MainWindow(QMainWindow):
             _vid_v.addWidget(_miss, stretch=1)
 
         # Stack: 0 = animated HUD, 1 = live camera, 2 = video
+        # Slot 0 is an empty, transparent window onto the HUD canvas behind
+        # the whole interface; the canvas centres the scene on this slot.
+        self._hud_slot = QWidget()
         self._hud_cam_stack = QStackedWidget()
-        self._hud_cam_stack.addWidget(self.hud)
+        self._hud_cam_stack.addWidget(self._hud_slot)
         self._hud_cam_stack.addWidget(_cam_cont)
         self._hud_cam_stack.addWidget(self._video_cont)
+        self.hud.area_provider = self._hud_area
 
         self._center_split = QSplitter(Qt.Orientation.Vertical)
         self._center_split.setStyleSheet(f"""
@@ -4292,9 +4605,20 @@ class MainWindow(QMainWindow):
         else:
             self.showFullScreen()
 
+    def _hud_area(self) -> QRectF:
+        """The HUD slot's rectangle in canvas coordinates — where the scene's
+        centrepiece goes, between the floating panels."""
+        st = self._hud_cam_stack
+        tl = st.mapTo(self.centralWidget(), QPoint(0, 0))
+        return QRectF(tl.x(), tl.y(), st.width(), st.height())
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         cw = self.centralWidget()
+        # The HUD canvas is the backdrop of the whole window.
+        if hasattr(self, "hud"):
+            self.hud.setGeometry(cw.rect())
+            self.hud.lower()
         if self._overlay and self._overlay.isVisible():
             ow, oh = 460, 390
             self._overlay.setGeometry(
@@ -4369,6 +4693,25 @@ class MainWindow(QMainWindow):
         else:
             self._bar_tmp.set_value(0, "N/A")
 
+        disk = snap.get("disk", -1.0)
+        if disk >= 0:
+            self._bar_dsk.set_value(disk, f"{disk:.0f}%")
+        else:
+            self._bar_dsk.set_value(0, "N/A")
+
+        bat = snap.get("bat")
+        if bat:
+            pct, plugged, secs = bat
+            if plugged:
+                txt = f"{pct:.0f}% ⚡"
+            elif isinstance(secs, (int, float)) and 0 < secs < 360000:
+                txt = f"{pct:.0f}% {int(secs // 3600)}:{int(secs % 3600 // 60):02d}"
+            else:
+                txt = f"{pct:.0f}%"
+            self._bar_bat.set_value(pct, txt)
+        else:
+            self._bar_bat.set_value(100, "AC")
+
         try:
             boot_t  = psutil.boot_time()
             elapsed = time.time() - boot_t
@@ -4386,20 +4729,13 @@ class MainWindow(QMainWindow):
 
 
     def _build_header(self) -> QWidget:
-        outer = QWidget()
+        outer = _DragBar()
         outer.setFixedHeight(_HEADER_H)
         ov = QVBoxLayout(outer)
         ov.setContentsMargins(0, 0, 0, 0)
         ov.setSpacing(0)
 
-        w = QWidget()
-        w.setObjectName("HeaderBar")
-        w.setStyleSheet(f"""
-            QWidget#HeaderBar {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 {C.DARK}, stop:0.5 {C.PANEL}, stop:1 {C.DARK});
-            }}
-        """)
+        w = QWidget()             # transparent: _DragBar paints the backdrop
         ov.addWidget(w, stretch=1)
         ov.addWidget(_ScanLine())
 
@@ -4461,15 +4797,13 @@ class MainWindow(QMainWindow):
         mid = QVBoxLayout(); mid.setSpacing(1)
         mid.setContentsMargins(0, 7, 0, 7)
         _disp = self._assistant_name.upper()
-        self._title_lbl = QLabel(_disp)
+        self._title_lbl = QLabel(_title_text(_disp))
         self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
         self._title_lbl.setFont(_display(16, QFont.Weight.Bold, spacing=7.0))
         self._title_lbl.setMinimumHeight(28)
         self._title_lbl.setStyleSheet(f"color: {C.WHITE}; background: transparent;")
         mid.addWidget(self._title_lbl)
-        _sub_text = ("NEURAL VOICE INTERFACE"
-                     if _disp in ("JARVIS", "J.A.R.V.I.S")
-                     else "PERSONAL AI ASSISTANT")
+        _sub_text = _subtitle_text(_disp)
         self._sub_lbl = QLabel(_sub_text)
         self._sub_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         self._sub_lbl.setFont(_display(7, QFont.Weight.Medium, spacing=3.0))
@@ -4498,6 +4832,19 @@ class MainWindow(QMainWindow):
         self._date_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
         right_col.addWidget(self._date_lbl)
         lay.addLayout(right_col)
+
+        # Window controls — the OS title bar is gone, so they live here.
+        lay.addSpacing(16)
+        _min = _window_button("—", "Minimise")
+        _min.clicked.connect(self.showMinimized)
+        self._max_btn = _window_button("▢", "Maximise / restore  (double-click the header)")
+        self._max_btn.clicked.connect(
+            lambda: self.showNormal() if self.isMaximized() else self.showMaximized())
+        _close = _window_button("✕", "Close", danger=True)
+        _close.clicked.connect(self.close)
+        for b in (_min, self._max_btn, _close):
+            lay.addWidget(b)
+            lay.addSpacing(4)
         return outer
 
     _LINK_CHIP = {"ONLINE": "GREEN", "CONNECTING": "ACC2",
@@ -4535,34 +4882,22 @@ class MainWindow(QMainWindow):
         self._date_lbl.setText(time.strftime("%a %d %b %Y"))
 
     def _build_left_panel(self) -> QWidget:
-        w = QWidget()
-        w.setObjectName("LeftPanel")
+        w = HoloPanel("SYSTEM DIAGNOSTICS")
         w.setFixedWidth(_LEFT_W)
-        w.setStyleSheet(f"""
-            QWidget#LeftPanel {{
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 {C.DARK}, stop:1 {C.BG});
-                border-right: 1px solid {C.BORDER};
-            }}""")
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(10, 12, 10, 12)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(7)
-
-        hdr = QLabel("◈  TELEMETRY")
-        hdr.setFont(_display(8, QFont.Weight.Bold, spacing=2.0))
-        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent; "
-                          f"border-bottom: 1px solid {C.BORDER}; padding-bottom: 5px;")
-        lay.addWidget(hdr)
-        lay.addSpacing(2)
 
         self._bar_cpu = MetricBar("CPU", C.PRI)
         self._bar_mem = MetricBar("MEM", C.ACC2)
         self._bar_net = MetricBar("NET", C.GREEN)
         self._bar_gpu = MetricBar("GPU", C.ACC)
         self._bar_tmp = MetricBar("TMP", "#ff6688")
+        self._bar_dsk = MetricBar("DISK", C.VIOLET)
+        self._bar_bat = MetricBar("PWR", C.GREEN, invert=True)
 
         for bar in [self._bar_cpu, self._bar_mem, self._bar_net,
-                    self._bar_gpu, self._bar_tmp]:
+                    self._bar_gpu, self._bar_tmp, self._bar_dsk, self._bar_bat]:
             lay.addWidget(bar)
 
         lay.addSpacing(4)
@@ -4612,17 +4947,10 @@ class MainWindow(QMainWindow):
 
         return w
     def _build_right_panel(self) -> QWidget:
-        w = QWidget()
-        w.setObjectName("RightPanel")
+        w = HoloPanel("COMMS  //  CONTROL")
         w.setFixedWidth(_RIGHT_W)
-        w.setStyleSheet(f"""
-            QWidget#RightPanel {{
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
-                    stop:0 {C.DARK}, stop:1 {C.BG});
-                border-left: 1px solid {C.BORDER};
-            }}""")
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(7)
 
         def _sec(txt):
@@ -5419,13 +5747,8 @@ class MainWindow(QMainWindow):
             threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
 
     def _build_footer(self) -> QWidget:
-        w = QWidget()
-        w.setObjectName("Footer")
+        w = _OpaqueBar(flip=True)
         w.setFixedHeight(26)
-        w.setStyleSheet(f"""
-            QWidget#Footer {{
-                background: {C.DARK}; border-top: 1px solid {C.BORDER};
-            }}""")
         lay = QHBoxLayout(w); lay.setContentsMargins(14, 0, 14, 0)
 
         def _fl(txt, color=C.TEXT_MED, bold=False):
@@ -5438,6 +5761,13 @@ class MainWindow(QMainWindow):
         lay.addStretch()
         lay.addWidget(_fl(f"◆ Built & maintained by {APP_MAINTAINER}", C.PRI, bold=True))
         lay.addWidget(_fl(f"  ·  based on MARK LV by {APP_ORIGINAL_AUTHOR}", C.TEXT_DIM))
+        # Frameless window: resize from the corner (or maximise / F11).
+        from PyQt6.QtWidgets import QSizeGrip
+        grip = QSizeGrip(w)
+        grip.setFixedSize(16, 16)
+        grip.setToolTip("Drag to resize")
+        lay.addSpacing(8)
+        lay.addWidget(grip, 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
         return w
 
     def _on_file_selected(self, path: str):
@@ -5682,6 +6012,10 @@ class MainWindow(QMainWindow):
 
     # (label, tooltip, log line) per HUD style; the button cycles in this order.
     _HUD_INFO = {
+        "stark": ("◆  HUD: STARK 3D",
+                  "The 3D J.A.R.V.I.S. projection table — gyroscope, arc reactor, "
+                  "holographic floor. Tap for the Nexus sphere.",
+                  "SYS: HUD switched to the Stark 3D interface."),
         "nexus": ("✦  HUD: NEXUS SPHERE",
                   "A holographic sphere with live telemetry that ripples with "
                   "the voice and turns with the state. Tap for the animated head.",
@@ -5692,7 +6026,7 @@ class MainWindow(QMainWindow):
                   "SYS: HUD switched to the animated face."),
         "core":  ("◉  HUD: REACTOR CORE",
                   "A reactor core that turns with the state and moves with your "
-                  "voice. Tap for the Nexus sphere.",
+                  "voice. Tap for the Stark 3D interface.",
                   "SYS: HUD switched to the reactor core."),
     }
 
@@ -5719,6 +6053,8 @@ class MainWindow(QMainWindow):
         want = HUD_STYLES[(HUD_STYLES.index(cur) + 1) % len(HUD_STYLES)]
         # The head can fail to build on a stripped-down install; skip it then.
         if want == "face" and getattr(self.hud, "_avatar", None) is None:
+            want = HUD_STYLES[(HUD_STYLES.index(want) + 1) % len(HUD_STYLES)]
+        if want == "stark" and getattr(self.hud, "_stark", None) is None:
             want = HUD_STYLES[(HUD_STYLES.index(want) + 1) % len(HUD_STYLES)]
         save_hud_style(want)
         try:
@@ -5892,11 +6228,8 @@ class MainWindow(QMainWindow):
         self._assistant_name = name.strip() or "JARVIS"
         display = self._assistant_name.upper()
         self.setWindowTitle(f"{display} — {APP_VERSION}")
-        self._title_lbl.setText(display)
-        if display in ("JARVIS", "J.A.R.V.I.S"):
-            self._sub_lbl.setText("NEURAL VOICE INTERFACE")
-        else:
-            self._sub_lbl.setText("PERSONAL AI ASSISTANT")
+        self._title_lbl.setText(_title_text(display))
+        self._sub_lbl.setText(_subtitle_text(display))
         self._log._ai_name_lc = self._assistant_name.lower()
         self.hud._assistant_name = display
 

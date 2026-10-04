@@ -130,19 +130,26 @@ def save_push_to_talk_enabled(enabled: bool) -> None:
     _save_flag("push_to_talk_enabled", enabled)
 
 
-HUD_STYLES = ("nexus", "face", "core")
-DEFAULT_HUD_STYLE = "nexus"
+HUD_STYLES = ("stark", "nexus", "face", "core")
+DEFAULT_HUD_STYLE = "stark"
+# Bumped when a UI release changes the default look. A config written by an
+# older UI is moved onto the new default ONCE; after that the user's own
+# choice in 🎛 → HUD is respected again.
+UI_GENERATION = 2
 
 
 def get_hud_style() -> str:
-    """Which centrepiece the HUD draws: the Nexus holographic sphere (default),
-    the animated head, or the reactor core.
+    """Which centrepiece the HUD draws: the Stark 3D JARVIS interface
+    (default), the Nexus sphere, the animated head, or the reactor core.
 
-    Taste, not capability — all three render in the same software painter and
-    cost about the same. The HUD button in 🎛 cycles through them and the
-    choice survives a restart.
+    Taste, not capability — all render in the same software painter. The HUD
+    button in 🎛 cycles through them and the choice survives a restart.
     """
-    v = str(load_api_keys().get("hud_style", DEFAULT_HUD_STYLE)).strip().lower()
+    data = load_api_keys()
+    if data and int(data.get("ui_generation", 1) or 1) < UI_GENERATION:
+        _patch_config(ui_generation=UI_GENERATION, hud_style=DEFAULT_HUD_STYLE)
+        return DEFAULT_HUD_STYLE
+    v = str(data.get("hud_style", DEFAULT_HUD_STYLE)).strip().lower()
     return v if v in HUD_STYLES else DEFAULT_HUD_STYLE
 
 
