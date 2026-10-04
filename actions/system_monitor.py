@@ -69,10 +69,26 @@ def _nvml_gpu() -> float:
         return -1.0
 
 
+def import_pynvml():
+    """Import the `pynvml` module quietly.
+
+    The module comes from the `nvidia-ml-py` package. The separate, deprecated
+    `pynvml` PyPI package now only installs an import hook that prints a
+    FutureWarning on every import — on top of the very module it redirects to.
+    Older installs of this app pulled it in, so the warning is silenced here
+    rather than shown to everyone who has not run `pip uninstall pynvml` yet.
+    """
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", FutureWarning)
+        import pynvml  # type: ignore
+    return pynvml
+
+
 def _get_gpu_usage() -> float:
     # pynvml — subprocess-free, works everywhere if installed
     try:
-        import pynvml  # type: ignore
+        pynvml = import_pynvml()
         pynvml.nvmlInit()
         h = pynvml.nvmlDeviceGetHandleByIndex(0)
         return float(pynvml.nvmlDeviceGetUtilizationRates(h).gpu)

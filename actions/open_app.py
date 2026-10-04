@@ -1,7 +1,10 @@
+import os
+import re
 import time
 import subprocess
 import platform
 import shutil
+from pathlib import Path
 
 try:
     import psutil
@@ -75,9 +78,47 @@ def _normalize(raw: str) -> str:
         if alias_key in key or key in alias_key:
             return os_map.get(_SYSTEM, raw)
 
-    return raw  
+    return raw
 
-def _launch_windows(app_name: str) -> bool:
+
+# ── Paths are not app names ──────────────────────────────────────────────────
+# The model sometimes hands this tool a file or folder path instead of an app
+# name — and, worse, a path it made up ("C:\Users\Username\Desktop\..."). The
+# Windows launcher used to push that into `start <path>` or type it into the
+# Start menu and then report "Opened ...", so the assistant told the user it had
+# opened something that does not exist. A path is now checked on disk first and
+# opened directly if real, or reported as missing if not.
+_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+_URL_RE = re.compile(r"^[A-Za-z][\w+.-]*://")
+
+
+def _looks_like_path(s: str) -> bool:
+    s = s.strip().strip('"')
+    if _URL_RE.match(s):
+        return False                  # a URL — the launcher hands it to the browser
+    return bool(_DRIVE_RE.match(s) or s.startswith(("~", "\\\\", "/", "./", ".\\"))
+                or "\\" in s or "/" in s)
+
+
+def _open_path(p: Path) -> bool:
+    try:
+        if _SYSTEM == "Windows":
+            os.startfile(str(p))                      # noqa: S606 — user-requested open
+        elif _SYSTEM == "Darwin":
+            subprocess.Popen(["open", str(p)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(["xdg-open", str(p)],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception as e:
+        print(f"[open_app] Could not open path {p}: {e}")
+        return False
+
+
+def _launch_windows(app_name: str) -> bool | str:
 
     if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
         try:
@@ -92,9 +133,11 @@ def _launch_windows(app_name: str) -> bool:
         except Exception as e:
             print(f"[open_app] subprocess failed: {e}")
 
-    if ":" in app_name:
+    # URI schemes such as "ms-settings:" or "spotify:". Quoted, with an empty
+    # window title first — `start` treats the first quoted argument as a title.
+    if re.match(r"^[A-Za-z][\w+.-]*:", app_name) and not _DRIVE_RE.match(app_name):
         try:
-            subprocess.Popen(f"start {app_name}", shell=True)
+            subprocess.Popen(f'start "" "{app_name}"', shell=True)
             time.sleep(1.0)
             return True
         except Exception:
@@ -109,7 +152,9 @@ def _launch_windows(app_name: str) -> bool:
         time.sleep(0.9)
         pyautogui.press("enter")
         time.sleep(2.5)
-        return True
+        # Typed into the Start menu and pressed Enter: something was launched,
+        # but there is no way to know it was the right thing. Said as such.
+        return "search"
     except Exception as e:
         print(f"[open_app] Start Menu search failed: {e}")
 
@@ -252,18 +297,37 @@ def open_app(
     if launcher is None:
         return f"Unsupported operating system: {_SYSTEM}"
 
-    normalized = _normalize(app_name)
-    print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
-
     if player:
         player.write_log(f"[open_app] {app_name}")
 
+    # A file or folder path: open it if it is real, say so if it is not.
+    if _looks_like_path(app_name):
+        p = Path(os.path.expandvars(os.path.expanduser(app_name.strip().strip('"'))))
+        print(f"[open_app] Path requested: {p}")
+        if p.exists():
+            return (f"Opened {p}." if _open_path(p)
+                    else f"Found {p} but could not open it.")
+        return (
+            f"Nothing exists at {p}. Do not tell the user it opened. The real home "
+            f"folder is {Path.home()} — never guess a path or a user name. Ask the "
+            f"user where it is, or search for it with file_controller first."
+        )
+
+    normalized = _normalize(app_name)
+    print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
+
     try:
-        if launcher(normalized):
+        result = launcher(normalized)
+        if not result and normalized.lower() != app_name.lower():
+            result = launcher(app_name)
+        if result == "search":
+            return (
+                f"Searched the Start menu for '{app_name}' and launched the top "
+                f"match. It could not be verified — if nothing opened, it is "
+                f"probably not installed."
+            )
+        if result:
             return f"Opened {app_name}."
-        if normalized.lower() != app_name.lower():
-            if launcher(app_name):
-                return f"Opened {app_name}."
         return (
             f"Could not confirm that {app_name} launched. "
             f"It may still be loading, or it might not be installed."

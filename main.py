@@ -10,7 +10,7 @@ if _platform.system() == "Windows":
         def __init__(self, args, **kw):
             kw["creationflags"] = kw.get("creationflags", 0) | _subprocess.CREATE_NO_WINDOW
             kw.pop("startupinfo", None)   # drop any stale/shared STARTUPINFO
-            super().__init__(args, **                       kw)
+            super().__init__(args, **kw)
 
     _subprocess.Popen = _Popen
 
@@ -35,6 +35,8 @@ for _stream in ("stdout", "stderr"):
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
+import collections
+import os
 import re
 import threading
 import time
@@ -71,7 +73,8 @@ from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import (
     get_brief_enabled, get_media_resolution, get_proactive_audio_enabled,
     get_push_to_talk_enabled, get_thinking_enabled, get_turn_tuning, get_voice,
-    get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
+    get_wake_word_enabled, save_wake_word_enabled, get_input_device, get_output_device,
+    get_context_compression,
 )
 from core                     import gemini as _gemini
 from core.plugin_loader        import discover_plugins
@@ -535,10 +538,109 @@ def _keep_context_of(exc: BaseException) -> bool:
     return True
 
 
+# ── Live-session failure classification ──────────────────────────────────────
+# The session runs inside a TaskGroup, so whatever kills it arrives wrapped in an
+# ExceptionGroup whose own text is "unhandled errors in a TaskGroup (1
+# sub-exception)". Matching keywords against THAT string is how two bugs got in:
+# "unhandled" contains "handle", so every failure after a resume was mistaken
+# for a rejected resumption handle; and no quota or API-key error raised
+# mid-session was ever recognised, because their text lives one level down.
+# Everything below therefore looks at the leaf exceptions, never at the group.
+
+# Full tracebacks for every dropped connection are noise in normal use — the
+# one-line summary says what happened. Set JARVIS_DEBUG=1 to get them back.
+_DEBUG = os.environ.get("JARVIS_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
+
+
+def _leaf_errors(exc: BaseException) -> list[BaseException]:
+    """Flatten (nested) exception groups into the exceptions that actually fired."""
+    if isinstance(exc, BaseExceptionGroup):
+        out: list[BaseException] = []
+        for sub in exc.exceptions:
+            out.extend(_leaf_errors(sub))
+        return out
+    return [exc]
+
+
+def _close_code(exc: BaseException) -> int | None:
+    """The WebSocket close code behind a failure (1011, 1007, 1008 …), if any.
+
+    The SDK re-raises a websocket close as `APIError(code=…)`, with the original
+    `ConnectionClosed` as its context — so both, and the chain between them, are
+    searched."""
+    for leaf in _leaf_errors(exc):
+        seen = 0
+        cur: BaseException | None = leaf
+        while cur is not None and seen < 6:
+            code = getattr(cur, "code", None)
+            if isinstance(code, int) and 1000 <= code <= 4999:
+                return code
+            rcvd = getattr(cur, "rcvd", None)            # websockets.ConnectionClosed
+            rcode = getattr(rcvd, "code", None)
+            if isinstance(rcode, int):
+                return rcode
+            cur = cur.__cause__ or cur.__context__
+            seen += 1
+    return None
+
+
+def _error_text(exc: BaseException) -> str:
+    """Every leaf message, joined — what keyword checks should run against."""
+    return " | ".join(f"{type(e).__name__}: {e}" for e in _leaf_errors(exc))
+
+
+def _is_server_internal(exc: BaseException) -> bool:
+    """A 1011 'Internal error encountered' from the Live server.
+
+    Quota exhaustion is ALSO delivered as a 1011 ("Resource has been
+    exhausted"), and that one must reach the model ladder instead, so it is
+    excluded here and checked first by the caller."""
+    text = _error_text(exc).lower()
+    if _gemini.is_quota_error(text):
+        return False
+    return _close_code(exc) == 1011 or "internal error" in text
+
+
+_RESUME_RE = re.compile(r"\bresum\w*|\bsession[ _-]?handle\b|\bhandle\b", re.IGNORECASE)
+
+
+def _mentions_resumption(text: str) -> bool:
+    """True when an error is about the resumption handle itself (whole words, so
+    'unhandled' no longer counts)."""
+    return bool(_RESUME_RE.search(text or ""))
+
+
+def _is_gen3_live(model: str) -> bool:
+    """gemini-3.x Live models accept a narrower config than the 2.5 ones.
+
+    Per Google's model page for gemini-3.1-flash-live-preview: function calling
+    is synchronous only (no NON_BLOCKING / scheduling), proactive audio and
+    affective dialog are not supported, and thinking is set with
+    `thinking_level` rather than `thinking_budget`. Sending the unsupported
+    fields does not always fail at connect time — which is exactly why they are
+    worth removing: they can fail later, mid-conversation, instead."""
+    return "gemini-3" in (model or "").lower()
+
+
+def _parse_seconds(value, default: float = 10.0) -> float:
+    """A GoAway `time_left` — '12s', '1.5s', a timedelta or a number — as seconds."""
+    if value is None:
+        return default
+    try:
+        if hasattr(value, "total_seconds"):
+            return float(value.total_seconds())
+        if isinstance(value, (int, float)):
+            return float(value)
+        m = re.search(r"[\d.]+", str(value))
+        return float(m.group(0)) if m else default
+    except Exception:
+        return default
+
+
 class JarvisLive:
     def __init__(self, ui: JarvisUI):
         self.ui             = ui
-        self._asst_name     = "JARVI    S"   # updated each session from config
+        self._asst_name     = "JARVIS"   # updated each session from config
         self.session              = None
         self.audio_in_queue       = None
         self.out_queue            = None
@@ -599,6 +701,22 @@ class JarvisLive:
         # conversation that never ends never produces a summary, and the
         # "yesterday we talked about…" line silently disappears.
         self._resume_handle: str | None = None
+
+        # ── Transcript-based recovery ──────────────────────────────────
+        # A resumption handle cannot survive every failure. After a 1011 the
+        # server-side session is broken, and replaying its handle restores the
+        # broken state with it: the resumed session dies again within a second
+        # of connecting. So for those cases the handle is dropped and the new
+        # session is seeded with the last few turns instead. This rolling buffer
+        # is separate from _session_log on purpose — that one is cleared every
+        # time a session summary is written, which happens on every disconnect.
+        self._recent_turns: collections.deque[str] = collections.deque(maxlen=24)
+        self._restore_pending = False   # next connect seeds context from the buffer
+        self._connected_at    = 0.0     # monotonic time the current session opened
+        self._quick_failures  = 0       # consecutive sessions that died young
+        self._conn_backoff    = 3
+        self._go_away_pending = False   # a GoAway refresh is already scheduled
+        self._wants_alpha     = False   # set by _build_config: v1alpha-only fields in use
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
         self._briefing_sent    = False          # morning briefing fires once per process
@@ -798,8 +916,9 @@ class JarvisLive:
         required. It is rebuilt WITHOUT the resumption handle on purpose:
         resuming restores the server's own session state, and the safe reading
         is that it restores the voice with it — which would make the picker
-        appear to do nothing. Losing context here is acceptable because changing
-        voice is a deliberate, rare act; losing it on a dropped packet was not."""
+        appear to do nothing. The conversation is not lost, though: the new
+        session is seeded from the transcript buffer instead (see
+        _recap_block), so the new voice picks up where the old one stopped."""
         self.request_reconnect(keep_context=False, reason="new voice")
 
     def _on_audio_device_change(self):
@@ -837,7 +956,7 @@ class JarvisLive:
         return url, key, f"{url}/auto-login?key={key}", manual
 
     def _on_text_command(self, text: str):
-        if not self._loop or not self.session:
+        if not self._loop:
             return
         # Respect wake-word sleep: a typed command must not be answered while
         # asleep either (the sleep gate is not just for the mic). Wake first with
@@ -845,12 +964,74 @@ class JarvisLive:
         if self._wake_enabled and not self._awake:
             self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
             return
-        asyncio.run_coroutine_threadsafe(
-            self.session.send_client_content(
+        # Typed by the user (not an app-generated [TAG] message) — part of the
+        # conversation a reconnect has to be able to restore.
+        if text and not text.lstrip().startswith("["):
+            self._recent_turns.append(f"User (typed): {text.strip()}")
+        # Not dropped while the link is down: a message typed during a
+        # reconnect used to vanish without a trace. It now waits for the
+        # session to come back, and says so if it never does.
+        if not self.session:
+            self.ui.write_log("SYS: Link is reconnecting — your message will be sent when it is back.")
+        asyncio.run_coroutine_threadsafe(self._send_text_when_ready(text), self._loop)
+
+    async def _send_text_when_ready(self, text: str, wait_s: float = 15.0) -> None:
+        deadline = time.monotonic() + wait_s
+        while not self.session and time.monotonic() < deadline:
+            await asyncio.sleep(0.1)
+        if not self.session:
+            self.ui.write_log("SYS: Still offline — that message was not sent. Try again in a moment.")
+            return
+        try:
+            await self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": text}]},
-                turn_complete=True
-            ),
-            self._loop
+                turn_complete=True,
+            )
+        except Exception as e:
+            print(f"[JARVIS] Text command not delivered: {e}")
+            self.ui.write_log("SYS: Message not delivered — the link dropped. Try again.")
+
+    def _log_turn(self, speaker: str, text: str) -> None:
+        """One finished turn → the session log (summaries) and the recap buffer
+        (reconnects)."""
+        line = f"{speaker}: {text}"
+        self._session_log.append(line)
+        self._recent_turns.append(line)
+
+    def _link(self, state: str, detail: str = "") -> None:
+        """Mirror the connection state onto the HUD's link indicator."""
+        try:
+            self.ui.set_link_status(state, detail)
+        except Exception:
+            pass
+
+    def _recap_block(self) -> str:
+        """The last turns of the conversation, for seeding a fresh session.
+
+        Written into the system instruction rather than replayed as history:
+        it works on every Live model the ladder can land on, needs no
+        model-specific history config, and cannot trip the server the way a
+        malformed client turn can — which matters, because this only ever runs
+        straight after the server has just fallen over once."""
+        turns = list(self._recent_turns)
+        if not turns:
+            return ""
+        lines: list[str] = []
+        budget = 4000
+        for t in reversed(turns):
+            t = t if len(t) <= 400 else t[:400] + "…"
+            if budget - len(t) < 0:
+                break
+            lines.append(t)
+            budget -= len(t)
+        lines.reverse()
+        return (
+            "[CONVERSATION SO FAR]\n"
+            "The live connection was reset a moment ago and this is a new session. "
+            "These are the most recent turns of the conversation, oldest first. "
+            "Continue from where it stopped: do not greet the user again, do not "
+            "mention the reset unless asked, and do not repeat your last answer.\n"
+            + "\n".join(lines) + "\n\n"
         )
 
     def _tail_active(self) -> bool:
@@ -1000,6 +1181,22 @@ class JarvisLive:
             f"{_addr}\n\n"
         )
 
+        # Real paths, so the model stops inventing them. Without this it filled
+        # in "C:\Users\Username\Desktop\..." for a folder the user named, and
+        # open_app was handed a path that never existed.
+        _home = Path.home()
+        machine_ctx = (
+            f"[MACHINE]\n"
+            f"User home folder: {_home}\n"
+            f"Desktop: {_home / 'Desktop'}  ·  Downloads: {_home / 'Downloads'}  ·  "
+            f"Documents: {_home / 'Documents'}\n"
+            f"Never invent a path or a placeholder user name. If you do not know "
+            f"where something is, find it with file_controller first.\n\n"
+        )
+
+        model = LIVE_MODEL
+        gen3  = _is_gen3_live(model)
+
         # Everything the model is told about *itself* is derived here, not
         # written into prompt.txt: the name comes from config, the platform from
         # the host, the capability list from the registries that were just
@@ -1008,10 +1205,27 @@ class JarvisLive:
         _all_decls = (TOOL_DECLARATIONS
                       + self._action_registry.get_tool_declarations()
                       + self._plugin_registry.get_tool_declarations())
+        if gen3:
+            # Async (NON_BLOCKING) function calling is not supported on 3.x
+            # Live — calls are synchronous only. A plugin that asked for it
+            # still works; it just runs the ordinary blocking way.
+            _all_decls = [{k: v for k, v in d.items() if k != "behavior"}
+                          if isinstance(d, dict) else d for d in _all_decls]
         _names = {(d.get("name") if isinstance(d, dict) else getattr(d, "name", ""))
                   for d in _all_decls}
+        try:
+            from memory.config_manager import get_hud_style
+            _style = get_hud_style()
+        except Exception:
+            _style = "nexus"
+        _body = {
+            "face": "the animated head in the centre of the window is your face",
+            "core": "the reactor core in the centre of the window is your body",
+        }.get(_style, "the holographic sphere in the centre of the window — it "
+                      "pulses with your voice — is your body")
         sys_prompt = _render_prompt(sys_prompt, {
             "assistant_name": self._asst_name,
+            "body": _body,
             "platform": f"{_platform.system()} {_platform.release()}".strip(),
             "capabilities": _describe_tools(_all_decls),
             "limits": _describe_limits(
@@ -1020,10 +1234,17 @@ class JarvisLive:
             ),
         })
 
-        parts = [time_ctx, identity_ctx]
+        parts = [time_ctx, identity_ctx, machine_ctx]
         if mem_str:
             parts.append(mem_str)
         parts.append(sys_prompt)
+        # Last, so it is the freshest thing the model reads before the user
+        # speaks. Only when there is no handle to resume — a resumed session
+        # already has its own history and must not get it twice.
+        if self._restore_pending and not self._resume_handle:
+            recap = self._recap_block()
+            if recap:
+                parts.append(recap)
 
         cfg = dict(
             response_modalities=["AUDIO"],
@@ -1031,21 +1252,13 @@ class JarvisLive:
             input_audio_transcription={},
             system_instruction="\n".join(parts),
             tools=[{"function_declarations": _all_decls}],
-            # Asks the server to issue session-resumption handles. Enabled but
-            # NOT yet used: no handle is captured from the resumption update and
-            # none is passed back here, so a reconnect starts a fresh session
-            # rather than continuing the old one. Left on because the handles
-            # cost nothing and are the prerequisite for doing it properly.
-            # Hand back the handle captured from the last session_resumption
-            # update. `handle=None` is exactly the old behaviour (ask for
-            # handles, start fresh), so the first connect of a run is unchanged.
+            # Asks the server to issue session-resumption handles and hands back
+            # the one captured from the last session_resumption update (see
+            # _receive_audio). `handle=None` asks for handles and starts fresh,
+            # which is what the first connect of a run — and every recovery
+            # from a 1011 — does.
             session_resumption=types.SessionResumptionConfig(
                 handle=self._resume_handle
-            ),
-            # Sliding-window compression: session never dies from a full context
-            # window — JARVIS can stay in one conversation for hours
-            context_window_compression=types.ContextWindowCompressionConfig(
-                sliding_window=types.SlidingWindow(),
             ),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
@@ -1055,22 +1268,35 @@ class JarvisLive:
                 )
             ),
         )
-        if self._enhanced_live:
-            # Proactive audio: JARVIS stays silent when speech isn't addressed
-            # to it (background chatter, talking to someone else in the room).
-            # (Affective dialog was dropped: gemini-3.1-flash-live does not
-            #  support it, and it never reliably detected tone in practice.
-            #  To restore it on a 2.5 native-audio model, add back:
-            #  cfg["enable_affective_dialog"] = True )
-            if get_proactive_audio_enabled():
-                cfg["proactivity"] = types.ProactivityConfig(proactive_audio=True)
+
+        # Sliding-window compression keeps one session alive for hours, but on
+        # gemini-3.1-flash-live it is the identified trigger for 1011 "Internal
+        # error encountered" — Google's own suggested workaround is to turn it
+        # off. So it defaults OFF on 3.x and ON elsewhere ("context_compression"
+        # in config/api_keys.json overrides either way). Without it a session
+        # simply ends at the server's limit, and the reconnect path carries the
+        # conversation into the next one from the transcript.
+        if get_context_compression(model_is_gen3=gen3):
+            cfg["context_window_compression"] = types.ContextWindowCompressionConfig(
+                sliding_window=types.SlidingWindow(),
+            )
+
+        # Proactive audio: the model stays silent when speech isn't addressed
+        # to it. 2.5 native-audio only — gemini-3.x Live does not support it
+        # (nor affective dialog), and Google's migration notes say to remove the
+        # config rather than rely on the server ignoring it.
+        if self._enhanced_live and not gen3 and get_proactive_audio_enabled():
+            cfg["proactivity"] = types.ProactivityConfig(proactive_audio=True)
+        # v1alpha is only needed to carry `proactivity`; everything else here is
+        # stable on v1beta, which is where the 3.x Live models are documented.
+        self._wants_alpha = "proactivity" in cfg
 
         if self._tuned_live:
-            cfg.update(self._tuning_config())
+            cfg.update(self._tuning_config(gen3))
 
         return types.LiveConnectConfig(**cfg)
 
-    def _tuning_config(self) -> dict:
+    def _tuning_config(self, gen3: bool = False) -> dict:
         """The optional knobs, kept apart so one bad field can be dropped wholesale.
 
         Every one of these is a preview-API field. If a future model release
@@ -1118,8 +1344,16 @@ class JarvisLive:
         # appear to deliberate on the Live path, so pinning the field only adds a
         # way for a future release to behave differently. Set "thinking_enabled"
         # in config/api_keys.json to true to let it reason instead.
+        #
+        # 3.x Live replaced the token budget with a level (its default is
+        # "minimal"); sending `thinking_budget` to it is a field it no longer
+        # documents, so each family gets the field it actually reads.
         if get_thinking_enabled():
-            out["thinking_config"] = types.ThinkingConfig(thinking_budget=-1)
+            if gen3:
+                out["thinking_config"] = types.ThinkingConfig(
+                    thinking_level=types.ThinkingLevel.LOW)
+            else:
+                out["thinking_config"] = types.ThinkingConfig(thinking_budget=-1)
 
         return out
 
@@ -1282,9 +1516,12 @@ class JarvisLive:
         # something like a phone call already ringing, is exactly the noise the
         # non-blocking call was meant to avoid. Tools that declared nothing get
         # the API default and behave as they always have.
+        # 3.x Live has no async function calling, so it has nothing to schedule
+        # either — the field is only sent where it means something.
         _sched = (self._action_registry.scheduling(name)
                   or self._plugin_registry.scheduling(name))
-        _extra = {"scheduling": _sched} if _sched else {}
+        _extra = ({"scheduling": _sched}
+                  if _sched and not _is_gen3_live(LIVE_MODEL) else {})
         return types.FunctionResponse(
             id=fc.id, name=name,
             response={"result": result},
@@ -1490,6 +1727,20 @@ class JarvisLive:
                                 print("[JARVIS] 🔗 Session resumption armed")
                             self._resume_handle = _sru.new_handle
 
+                    # ── GoAway ───────────────────────────────────────────────
+                    # The server's notice that this connection is about to be
+                    # closed (connection lifetime reached). Ignored before, so
+                    # the link was simply cut — often mid-sentence — and came
+                    # back through the error path. Now the link is rebuilt in
+                    # the next quiet moment, on the resumption handle.
+                    _ga = getattr(response, "go_away", None)
+                    if _ga is not None and not self._go_away_pending:
+                        self._go_away_pending = True
+                        _left = _parse_seconds(getattr(_ga, "time_left", None))
+                        print(f"[JARVIS] ⏳ Server GoAway — link closes in ~{_left:.0f}s; "
+                              f"refreshing it between turns.")
+                        asyncio.create_task(self._refresh_link_before(_left))
+
                     if response.data:
                         if self._interrupted:
                             pass  # discard: interrupted
@@ -1546,7 +1797,7 @@ class JarvisLive:
                             if full_in:
                                 self._last_out_logged = ""   # new exchange
                                 self.ui.write_log(f"You: {full_in}")
-                                self._session_log.append(f"User: {full_in}")
+                                self._log_turn("User", full_in)
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "user",
@@ -1565,7 +1816,7 @@ class JarvisLive:
                             if full_out:
                                 self._last_out_logged = full_out
                                 self.ui.write_log(f"{self._asst_name}: {full_out}")
-                                self._session_log.append(f"{self._asst_name}: {full_out}")
+                                self._log_turn(self._asst_name, full_out)
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "jarvis",
@@ -1594,9 +1845,33 @@ class JarvisLive:
                         )
                         await self._flush_pending_vision()
         except Exception as e:
-            print(f"[JARVIS] ❌ Recv: {e}")
-            traceback.print_exc()
+            # One line is enough to say what happened; the run loop decides
+            # what to do about it. JARVIS_DEBUG=1 restores the full traceback.
+            _code = _close_code(e)
+            print(f"[JARVIS] ❌ Recv: {e}" + (f"  [close {_code}]" if _code else ""))
+            if _DEBUG:
+                traceback.print_exc()
             raise
+
+    async def _refresh_link_before(self, time_left: float) -> None:
+        """Rebuild the connection before the server's GoAway deadline, waiting
+        for a gap in the conversation so nothing is cut off mid-sentence."""
+        deadline = time.monotonic() + max(0.0, time_left - 1.5)
+        while time.monotonic() < deadline:
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            if not speaking and not self._vision_busy:
+                break
+            await asyncio.sleep(0.2)
+        if self._reconnect_event is None or not self.session:
+            return
+        # With a handle this is a seamless resume; without one (none issued yet)
+        # the transcript carries the conversation over instead.
+        self._reconnect_keep = self._resume_handle is not None
+        if not self._reconnect_keep:
+            self._restore_pending = True
+        self._reconnect_reason = "link refresh"
+        self._reconnect_event.set()
 
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
@@ -2095,6 +2370,7 @@ class JarvisLive:
             try:
                 print("[JARVIS] Connecting...")
                 self.ui.set_state("THINKING")
+                self._link("CONNECTING")
                 # Pick the rung to open the conversation on. A model resting
                 # off a quota limit is skipped; the name is published back to
                 # LIVE_MODEL so plugins follow whatever is actually in use.
@@ -2104,14 +2380,15 @@ class JarvisLive:
                 print(f"[JARVIS] Live model: {live_model}")
 
                 _resumed_with = self._resume_handle is not None
+                _restoring    = self._restore_pending and not _resumed_with
                 config = self._build_config()
 
-                # Fresh client on every reconnect — avoids stale HTTP session state
-                # v1alpha carries proactive audio; if it gets rejected we fall
-                # back to v1beta.
+                # Fresh client on every reconnect — avoids stale HTTP session
+                # state. v1alpha only when a field that needs it (proactive
+                # audio on a 2.5 model) is actually in the config.
                 client = genai.Client(
                     api_key=_get_api_key(),
-                    http_options={"api_version": "v1alpha" if self._enhanced_live else "v1beta"}
+                    http_options={"api_version": "v1alpha" if self._wants_alpha else "v1beta"}
                 )
 
                 async with (
@@ -2130,13 +2407,22 @@ class JarvisLive:
                     self._vision_busy          = False
                     self._vision_last_time     = 0.0
                     self._interrupted          = False
+                    self._go_away_pending      = False
+                    self._connected_at         = time.monotonic()
 
                     print("[JARVIS] Connected.")
+                    self._link("ONLINE", live_model.split("/")[-1])
                     if _resumed_with:
                         # Say it plainly: the difference between "it reconnected"
                         # and "it reconnected and still knows what we were doing"
                         # is the whole point, and it is invisible otherwise.
                         self.ui.write_log("SYS: Reconnected — conversation restored.")
+                    elif _restoring:
+                        self._restore_pending = False
+                        if self._recent_turns:
+                            print(f"[JARVIS] 🧩 Fresh session seeded with the last "
+                                  f"{len(self._recent_turns)} turns")
+                            self.ui.write_log("SYS: Reconnected — conversation carried over.")
 
                     # Wake word: if enabled, come up ASLEEP (mic gated, silent)
                     # until the user says "Hey Jarvis" or taps wake in the UI.
@@ -2183,111 +2469,185 @@ class JarvisLive:
                 # externally, which `except Exception` would miss, letting the
                 # exception escape the while-loop and causing asyncio.run() to
                 # start shutdown — resulting in "executor after shutdown" errors).
-                # Voluntary reconnect (voice change) — not an error. Rebuild the
-                # session immediately with no backoff and no scary logs.
+                #
+                # But when run() ITSELF is being cancelled (shutdown), that is
+                # not a session failure to recover from: catching it here made
+                # the loop impossible to stop and reconnected instead. A real
+                # cancel of run() arrives as a bare CancelledError; a session
+                # failure arrives wrapped in an ExceptionGroup. (cancelling()
+                # alone cannot tell them apart on Python 3.11, where a failed
+                # TaskGroup leaves the parent's cancel count raised.)
+                _me = asyncio.current_task()
+                if (isinstance(e, asyncio.CancelledError)
+                        and _me is not None and _me.cancelling()):
+                    raise
+                lived = (time.monotonic() - self._connected_at) if self._connected_at else 0.0
+                self._connected_at = 0.0
+
+                # Voluntary reconnect (voice change, device change, GoAway
+                # refresh) — not an error. Rebuild the session immediately with
+                # no backoff and no scary logs.
                 if _is_reconnect_signal(e):
                     print("[JARVIS] Voluntary reconnect requested.")
                     if not _keep_context_of(e):
-                        # A deliberate clean slate (voice change) — drop the
-                        # handle so the next connect really does start empty.
+                        # A deliberate clean slate on the server (voice change)
+                        # — drop the handle, carry the talk over from the
+                        # transcript instead.
                         self._resume_handle = None
+                        self._restore_pending = True
                     self._conn_backoff = 0
+                    self._quick_failures = 0
                     continue
 
-                # A resumption handle the server will not accept — expired, or
-                # belonging to a session it has since dropped. Without this, the
-                # same dead handle would be replayed on every retry and the
-                # assistant would never come back at all: the feature meant to
-                # survive a reconnect would be the thing preventing one. Drop it
-                # once and let the next attempt start clean.
-                if _resumed_with and (
-                    "resum" in str(e).lower()
-                    or "handle" in str(e).lower()
-                    or "INVALID_ARGUMENT" in str(e)
-                    or "NOT_FOUND" in str(e)
-                ):
-                    print("[JARVIS] 🔗 Resumption handle rejected — starting a fresh session")
-                    self.ui.write_log("SYS: Could not restore the conversation — starting fresh.")
-                    self._resume_handle = None
-                    self._conn_backoff = 0
-                    continue
+                # Every check below reads the leaf exceptions, never the
+                # TaskGroup wrapper — see _leaf_errors for why.
+                err_str = _error_text(e)
+                code    = _close_code(e)
+                if lived >= 60:
+                    self._quick_failures = 0       # it had been healthy
+                self._quick_failures += 1
 
-                err_str = str(e)
-                print(f"[JARVIS] Error ({type(e).__name__}): {e}")
-                traceback.print_exc()
-
-                # Out of quota, or this model is not available to this key —
-                # step down the ladder and reconnect straight away. This is the
-                # difference between "JARVIS is quieter today" and "JARVIS does
-                # not start today": one model means one daily limit, and the
-                # limit always arrives mid-conversation.
-                if _gemini.note_live_failure(live_model, err_str):
+                # Out of quota — step down the ladder and reconnect straight
+                # away. Checked first because quota exhaustion can ALSO arrive
+                # as a 1011. A model that is gone for this key is only judged
+                # at connect time (lived == 0): mid-session, "not found" is far
+                # more likely a stale resumption handle, and mistaking it for a
+                # missing model would bench the model for six hours.
+                if ((_gemini.is_quota_error(err_str) or (lived == 0 and not _resumed_with))
+                        and _gemini.note_live_failure(live_model, err_str)):
                     nxt = _gemini.live_model()
                     self.ui.write_log(
                         f"SYS: Switching to {nxt.split('/')[-1]} — the previous "
-                        f"model is out of quota."
+                        f"model is unavailable right now."
                         if nxt != live_model else
                         "SYS: Every live model is rate-limited — retrying.")
+                    self._link("RECOVERING", "model ladder")
                     self._conn_backoff = 0 if nxt != live_model else 15
                     if nxt == live_model:
                         await asyncio.sleep(self._conn_backoff)
                     continue
 
-                # Turn-taking / media / thinking knobs rejected by the server
-                # (preview API drift) — drop them first, because they are the
-                # newest fields and the cheapest to lose. Proactive audio is
-                # tried again on the next pass if the error persists.
-                if self._tuned_live and (
-                    "INVALID_ARGUMENT" in err_str
-                    or "Unknown name" in err_str
-                    or "unexpected keyword" in err_str
-                    or "realtime_input" in err_str.lower()
-                    or "media_resolution" in err_str.lower()
-                    or "thinking" in err_str.lower()
-                ):
-                    self._tuned_live = False
-                    print("[JARVIS] Live tuning rejected — reconnecting without it.")
-                    continue
-
-                # Proactive audio rejected by the server (preview API drift) —
-                # drop it and reconnect with the plain config.
-                if self._enhanced_live and (
-                    "INVALID_ARGUMENT" in err_str
-                    or "proactiv" in err_str.lower()
-                    or "Unknown name" in err_str
-                    or "unexpected keyword" in err_str
-                ):
-                    self._enhanced_live = False
+                # 1011 "Internal error encountered" — the server dropped the
+                # session. It is Google's fault, not ours, but it leaves the
+                # server-side session poisoned: resuming it replays the broken
+                # state and dies again within a second (the second crash in the
+                # original report). So: never resume after a 1011. Start a fresh
+                # session seeded from the transcript, back off gently if it
+                # keeps happening, and tell the user in one calm line.
+                if _is_server_internal(e):
+                    self._resume_handle = None
+                    self._restore_pending = True
+                    delay = (1, 2, 5, 10, 20, 30)[min(self._quick_failures, 6) - 1]
+                    self._conn_backoff = delay
+                    print(f"[JARVIS] ⚠ Gemini closed the session with 1011 (server internal "
+                          f"error) after {lived:.0f}s — reconnecting fresh in {delay}s, "
+                          f"conversation carried over.")
+                    if _DEBUG:
+                        traceback.print_exception(e)
                     self.ui.write_log(
-                        "SYS: Proactive audio unavailable — reconnecting without it."
-                    )
+                        "SYS: Gemini server hiccup — reconnecting, your conversation is kept."
+                        if self._quick_failures < 4 else
+                        "SYS: Gemini keeps dropping the session — still retrying. "
+                        "If this persists, the service may be having an outage.")
+                    self._link("RECOVERING", "server 1011")
+
+                # A resumption handle the server will not accept — expired, or
+                # belonging to a session it has since dropped. Without this, the
+                # same dead handle would be replayed on every retry and the
+                # assistant would never come back at all. A resumed session that
+                # dies within seconds counts too, whatever the error says.
+                elif _resumed_with and (
+                    lived < 20
+                    or _mentions_resumption(err_str)
+                    or "INVALID_ARGUMENT" in err_str
+                    or "NOT_FOUND" in err_str
+                ):
+                    print("[JARVIS] 🔗 Resumption handle rejected — starting a fresh session")
+                    self.ui.write_log("SYS: Could not resume — continuing in a fresh session.")
+                    self._resume_handle = None
+                    self._restore_pending = True
+                    self._conn_backoff = 0
                     continue
 
-                # Invalid API key — stop hammering the API, prompt re-configuration
-                if "API key not valid" in err_str or "1007" in err_str:
-                    self.ui.write_log("ERR: API key invalid — please re-enter your key.")
-                    self.ui.set_state("SLEEPING")
-                    self.ui.prompt_reconfig()
-                    while not self.ui._win._ready:
-                        await asyncio.sleep(1)
-                    print("[JARVIS] New API key saved — reconnecting...")
-                    _conn_backoff = 3
-                    continue
-
-                # Network / timeout errors — log clearly and back off
-                is_net_err = any(k in err_str for k in (
-                    "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
-                    "ConnectionRefusedError", "OSError", "Cannot connect",
-                ))
-                if is_net_err:
-                    _conn_backoff = min(getattr(self, "_conn_backoff", 3) * 2, 60)
-                    self._conn_backoff = _conn_backoff
-                    self.ui.write_log(
-                        f"NET: Connection failed — retrying in {_conn_backoff}s. "
-                        "(a VPN may be required)"
-                    )
                 else:
-                    self._conn_backoff = 3
+                    print(f"[JARVIS] Error ({type(e).__name__}): {err_str[:300]}"
+                          + (f"  [close {code}]" if code else ""))
+                    if _DEBUG:
+                        traceback.print_exception(e)
+                    self._link("OFFLINE", (f"close {code}" if code else type(e).__name__))
+                    low = err_str.lower()
+
+                    # Invalid API key — stop hammering the API, prompt
+                    # re-configuration. Checked before the config fallbacks:
+                    # a bad key is also an INVALID_ARGUMENT, and treating it
+                    # as one used to strip the tuning and proactive audio for
+                    # the rest of the run before ever asking for a new key.
+                    # A bare 1007 is NOT treated as a bad key any more — it is
+                    # also what an unsupported field produces.
+                    if "api key not valid" in low or "api_key_invalid" in low:
+                        self.ui.write_log("ERR: API key invalid — please re-enter your key.")
+                        self.ui.set_state("SLEEPING")
+                        self.ui.prompt_reconfig()
+                        while not self.ui._win._ready:
+                            await asyncio.sleep(1)
+                        print("[JARVIS] New API key saved — reconnecting...")
+                        self._conn_backoff = 3
+                        continue
+
+                    _rejected_field = (
+                        "invalid_argument" in low
+                        or "unknown name" in low
+                        or "unexpected keyword" in low
+                        or "not supported" in low
+                        or "not implemented" in low
+                        or code in (1007, 1008)
+                    )
+
+                    # Turn-taking / media / thinking knobs rejected by the
+                    # server (preview API drift) — drop them first, because
+                    # they are the newest fields and the cheapest to lose.
+                    # Proactive audio is tried again on the next pass if the
+                    # error persists.
+                    if self._tuned_live and (
+                        _rejected_field
+                        or "realtime_input" in low
+                        or "media_resolution" in low
+                        or "thinking" in low
+                    ):
+                        self._tuned_live = False
+                        print("[JARVIS] Live tuning rejected — reconnecting without it.")
+                        continue
+
+                    # Proactive audio rejected by the server — drop it and
+                    # reconnect with the plain config.
+                    if self._enhanced_live and self._wants_alpha and (
+                        _rejected_field or "proactiv" in low
+                    ):
+                        self._enhanced_live = False
+                        self.ui.write_log(
+                            "SYS: Proactive audio unavailable — reconnecting without it."
+                        )
+                        continue
+
+                    # Network / timeout errors — log clearly and back off. A
+                    # close with no code at all (1006) is a dropped network
+                    # too, not a server fault.
+                    is_net_err = code == 1006 or any(k in err_str for k in (
+                        "TimeoutError", "timed out", "getaddrinfo", "CancelledError",
+                        "ConnectionRefusedError", "OSError", "Cannot connect",
+                        "no close frame",
+                    ))
+                    if is_net_err:
+                        self._conn_backoff = min(max(self._conn_backoff, 3) * 2, 60)
+                        self.ui.write_log(
+                            f"NET: Connection failed — retrying in {self._conn_backoff}s. "
+                            "(a VPN may be required)"
+                        )
+                    else:
+                        # Anything else: retry, but a session that keeps
+                        # dying young must not be reconnected in a tight loop.
+                        self._conn_backoff = (3, 3, 6, 12, 24, 30)[
+                            min(self._quick_failures, 6) - 1]
             finally:
                 self.session = None
                 # Only save if there was a real conversation (≥3 turns)

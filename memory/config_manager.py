@@ -130,24 +130,25 @@ def save_push_to_talk_enabled(enabled: bool) -> None:
     _save_flag("push_to_talk_enabled", enabled)
 
 
-HUD_STYLES = ("face", "core")
+HUD_STYLES = ("nexus", "face", "core")
+DEFAULT_HUD_STYLE = "nexus"
 
 
 def get_hud_style() -> str:
-    """Which centrepiece the HUD draws: the animated head, or the reactor core.
+    """Which centrepiece the HUD draws: the Nexus holographic sphere (default),
+    the animated head, or the reactor core.
 
-    Taste, not capability — both render in the same software painter and cost
-    about the same. Defaults to the head because that is what MARK LIV shipped
-    with; anyone who preferred the older look can switch back in ⚙ and the
+    Taste, not capability — all three render in the same software painter and
+    cost about the same. The HUD button in 🎛 cycles through them and the
     choice survives a restart.
     """
-    v = str(load_api_keys().get("hud_style", "face")).strip().lower()
-    return v if v in HUD_STYLES else "face"
+    v = str(load_api_keys().get("hud_style", DEFAULT_HUD_STYLE)).strip().lower()
+    return v if v in HUD_STYLES else DEFAULT_HUD_STYLE
 
 
 def save_hud_style(style: str) -> None:
     s = str(style or "").strip().lower()
-    _save_flag("hud_style", s if s in HUD_STYLES else "face")
+    _save_flag("hud_style", s if s in HUD_STYLES else DEFAULT_HUD_STYLE)
 
 
 # ── Live-session tuning ──────────────────────────────────────────────────────
@@ -233,6 +234,27 @@ def get_proactive_audio_enabled() -> bool:
 
 def save_proactive_audio_enabled(enabled: bool) -> None:
     _save_flag("proactive_audio", enabled)
+
+
+def get_context_compression(model_is_gen3: bool) -> bool:
+    """Whether the Live session uses sliding-window context compression.
+
+    "auto" (the default) means OFF on gemini-3.x Live and ON on older models.
+    On gemini-3.1-flash-live, compression is the identified trigger for the
+    server closing sessions with 1011 "Internal error encountered" — Google's
+    suggested workaround is to disable it — while on 2.5 native-audio it is
+    what lets one conversation run for hours. Set "context_compression" to
+    true or false in config/api_keys.json to force either behaviour.
+    """
+    v = load_api_keys().get("context_compression", "auto")
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    if s in ("on", "true", "1", "yes"):
+        return True
+    if s in ("off", "false", "0", "no"):
+        return False
+    return not model_is_gen3
 
 
 MEDIA_RESOLUTIONS = ("default", "low", "medium", "high")

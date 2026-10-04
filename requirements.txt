@@ -88,7 +88,11 @@ ddgs>=9,<10                  # web_search — the maintained successor to
 pdfplumber                   # file_processor — PDF text and tables
 PyPDF2                       # file_processor — PDF fallback reader
 python-docx                  # file_processor — .docx reading
-pynvml                       # system_monitor + the HUD's GPU meter (NVIDIA)
+nvidia-ml-py                 # system_monitor + the HUD's GPU meter (NVIDIA).
+                             # Provides the `pynvml` module. Do NOT install the
+                             # deprecated `pynvml` package — it only adds an
+                             # import hook that prints a FutureWarning. If an
+                             # older setup installed it: pip uninstall pynvml
 
 # ── Optional: heavy extras, install only if you want the feature ──────────────
 # Left out on purpose — together they are several hundred megabytes, which is a

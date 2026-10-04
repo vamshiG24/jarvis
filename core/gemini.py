@@ -233,7 +233,12 @@ def _cool(model: str, seconds: float = _COOLDOWN_SECONDS) -> None:
 
 
 def is_quota_error(err: str) -> bool:
-    return "429" in err or "RESOURCE_EXHAUSTED" in err
+    # The Live API reports an exhausted quota as a websocket close — often a
+    # 1011 whose reason reads "Resource has been exhausted" — rather than as an
+    # HTTP 429, so the reason text is matched too.
+    low = err.lower()
+    return ("429" in err or "resource_exhausted" in low
+            or "resource has been exhausted" in low or "quota" in low)
 
 
 def is_unavailable_error(err: str) -> bool:
