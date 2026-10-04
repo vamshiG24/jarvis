@@ -1,4 +1,4 @@
-# ◆ MARK LV — Nexus Edition
+# ◆ MARK LV — Stark Edition
 
 ### A real-time voice AI that can hear, see, speak and control your computer
 
@@ -9,7 +9,7 @@ A desktop JARVIS-style assistant for Windows, macOS and Linux, built on the
 screen, and let it open apps, manage files, search the web, play video, set
 reminders and more. There's no subscription; you only need a free Gemini API key.
 
-![The Nexus UI, speaking while recovering from a server 1011](docs/images/nexus-ui.png)
+![The Stark 3D HUD: J.A.R.V.I.S. speaking, with the gyroscope, arc reactor and projection table](docs/images/stark-ui.png)
 
 > 📐 **How it works inside:** [ARCHITECTURE.md](ARCHITECTURE.md) has diagrams of the threads, audio pipeline, tool calls and session recovery.
 
@@ -17,7 +17,7 @@ reminders and more. There's no subscription; you only need a free Gemini API key
 
 ## 🆕 What's new in this build
 
-This branch adds three things on top of MARK LV: a fix for the Live session crash, a new HUD, and a round of correctness fixes.
+This branch adds three things on top of MARK LV: a fix for the Live session crash, a 3D Iron Man-style interface, and a round of correctness fixes.
 
 ### 🛡️ Stable Live sessions — the `1011 Internal error` crash is handled
 
@@ -41,16 +41,36 @@ Also added:
 * **Calm logging.** One line per dropped connection instead of a 60-line traceback. Set `JARVIS_DEBUG=1` to get full tracebacks back.
 * **A live link indicator** in the header and HUD: `ONLINE` / `CONNECTING` / `RECOVERING` / `OFFLINE`.
 
-### 🎨 The Nexus UI
+### 🦾 The Stark UI — a 3D J.A.R.V.I.S. interface
+
+The whole window is now a holographic projection table in the style of the Iron
+Man films. A small software 3D engine (`core/hud3d.py`) renders the scene;
+the panels float over it as holographic glass.
 
 | | |
 |---|---|
-| ✦ **Nexus HUD** *(new default)* | A 340-point holographic sphere that ripples with the voice and assembles itself on boot. Around it: tilted orbit rings with satellites, a segmented ring that chases while thinking, a radial **voice trail** (the last 1.6 s of audio), a radar sweep, a hex-lattice backdrop, and live corner telemetry (link, session timer, voice meter, state). |
+| 🌀 **3D gyroscope** | Seven rings turning on different axes around the core. Some are segmented, some dashed, some carry tick marks and degree labels. A perspective camera orbits slowly and leans toward your mouse. |
+| ⚛️ **Arc reactor core** | Ten coil segments, the triangle element and a hot centre that swells with the voice. |
+| 🟦 **Projection table** | A grid floor receding to the horizon, a projector beam rising to the core, particles drifting through the volume, and sonar rings that roll across the floor while it speaks. |
+| 🎚️ **Voice crown** | An equalizer standing up around the core, driven by the real audio. |
+| 🎯 **Helmet HUD overlays** | CPU and memory arc gauges flanking the core, a heading tape across the top, and corner read-outs (neural link, session timer, voice level, core state). |
+| 🎨 **State is colour** | Cyan when listening, white-hot when speaking, gold when thinking, amber when recovering, red when muted. |
+| 🚀 **Boot sequence** | "INITIALISING J.A.R.V.I.S." with the rings drawing themselves in, then "ALL SYSTEMS ONLINE". |
+| 🪟 **Floating glass panels** | Chamfered corners, glowing edges and title tabs: **System Diagnostics** (now with disk and battery) and **Comms // Control**. |
+| 🖥️ **Frameless window** | The header is the title bar: drag to move (with Windows snapping), double-click to maximise, and window controls top-right. Resize from the bottom-right grip; F11 for fullscreen. |
+
+**Performance:** about 10–12 ms per frame on a laptop CPU, the same as the original animated face. The rate drops to about 10 fps when the window isn't focused, unless the assistant is speaking. The panels are opaque on purpose, so Qt never repaints them along with the scene.
+
+### 🎨 Also in the UI
+
+| | |
+|---|---|
+| ✦ **Nexus HUD** | A 340-point holographic sphere that ripples with the voice and assembles itself on boot. Around it: tilted orbit rings with satellites, a segmented ring that chases while thinking, a radial **voice trail** (the last 1.6 s of audio), a radar sweep, a hex-lattice backdrop, and live corner telemetry (link, session timer, voice meter, state). |
 | 📊 **Telemetry tiles** | CPU, MEM, NET, GPU and TMP, each with a one-minute **sparkline**, a severity accent and a gradient bar. |
 | 💬 **Activity log** | Timestamped entries with coloured speaker badges (`YOU`, `JARVIS`, `SYS`, `NET`, `ERR`, `FILE`, `WEB`) and a typewriter effect that speeds up for long answers. |
 | 🧭 **Header** | Logo mark, letter-spaced title, live link chip with the active model, clock, and an animated scan line. |
 | 🔤 **Typography** | Cascadia Code / Bahnschrift with cross-platform fallbacks, replacing Courier New everywhere. |
-| 🎛 **Three HUD styles** | 🎛 → HUD cycles **Nexus → Animated face → Reactor core**. The choice is saved. |
+| 🎛 **Four HUD styles** | 🎛 → HUD cycles **Stark 3D → Nexus → Animated face → Reactor core**. The choice is saved. |
 
 Everything is still drawn in software with `QPainter`, so you don't need a GPU. The
 Nexus sphere renders in about 5 ms per frame, and idle repaint stays at around 20 Hz.
@@ -148,7 +168,7 @@ These are the advanced keys:
 
 | Key | Default | What it does |
 |---|---|---|
-| `hud_style` | `"nexus"` | `nexus`, `face` or `core`. Cycle with 🎛 → HUD |
+| `hud_style` | `"stark"` | `stark`, `nexus`, `face` or `core`. Cycle with 🎛 → HUD |
 | `context_compression` | `"auto"` | `auto` = off on Gemini 3.x Live (avoids 1011s), on for 2.5. Use `true` or `false` to force it |
 | `thinking_enabled` | `false` | Lets the Live model reason before answering (uses `thinking_level` on 3.x) |
 | `proactive_audio` | `true` | 2.5 native-audio only. Ignored on 3.x, which doesn't support it |

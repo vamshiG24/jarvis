@@ -258,38 +258,63 @@ always look inside the group.
 
 ## 6. UI composition
 
+The HUD canvas is the **backdrop of the whole window**: one widget behind
+everything else, sized to the window. The layout sits on top of it, with
+opaque floating panels and an empty, transparent slot in the centre. The
+canvas centres the scene on that slot (`area_provider`).
+
 ```mermaid
 flowchart TB
-    subgraph WIN["MainWindow (QMainWindow)"]
+    subgraph WIN["MainWindow — frameless"]
         direction TB
-        HDR["Header — logo · ⚙ Setup · 🎛 Controls · title · link chip · clock<br/>+ animated scan line"]
-        subgraph BODY["Body"]
-            direction LR
-            LEFT["Left panel<br/>Telemetry tiles (sparklines)<br/>CPU · MEM · NET · GPU · TMP<br/>uptime · processes · OS"]
-            subgraph CENTER["Centre (QSplitter)"]
-                STACK["QStackedWidget<br/>0 HudCanvas · 1 Camera · 2 Video"]
-                CONTENT["Content panel<br/>search · news · reviews"]
-                QUIZ["Quiz panel"]
+        CANVAS["HudCanvas — full-window backdrop<br/>Stark 3D scene · Nexus · Face · Core"]
+        subgraph LAYOUT["Layout on top of the canvas"]
+            direction TB
+            HDR["_DragBar header (opaque) — drag to move<br/>logo · ⚙ · 🎛 · J.A.R.V.I.S. title · link chip · clock · window controls"]
+            subgraph BODY["Body"]
+                direction LR
+                LEFT["HoloPanel: SYSTEM DIAGNOSTICS<br/>CPU · MEM · NET · GPU · TMP · DISK · PWR tiles"]
+                subgraph CENTER["Centre (QSplitter)"]
+                    STACK["QStackedWidget<br/>0 transparent HUD slot · 1 Camera · 2 Video"]
+                    CONTENT["Content panel · Quiz panel"]
+                end
+                RIGHT["HoloPanel: COMMS // CONTROL<br/>Activity log · File drop · Command · Interrupt · Mic"]
             end
-            RIGHT["Right panel<br/>Activity log (speaker badges)<br/>File drop · Command input<br/>Interrupt · Mic"]
+            FTR["Footer (opaque) — shortcuts · credits · size grip"]
         end
-        FTR["Footer — shortcuts · maintainer credit · original author credit"]
     end
     OVER["Floating overlays<br/>Setup · Customise · Audio devices · Memory · Plugins<br/>Remote QR · Confirm banner · Clipboard · Camera preview"]
+    CANVAS -.->|centres scene on| STACK
     WIN --- OVER
 ```
+
+**Why the panels are opaque.** The scene repaints 20–30 times a second. Qt
+skips everything under an opaque widget when it repaints the widget behind it.
+With translucent header and footer bars, every frame also repainted fifteen
+labels and buttons; now only the canvas and three empty containers repaint.
+`HoloPanel` paints its glass look once into a cached pixmap.
 
 **HUD styles.** These live in `HudCanvas`; the 🎛 HUD button cycles through them and the choice is saved as `hud_style`:
 
 | Style | What it draws |
 |---|---|
-| `nexus` *(default)* | A 340-point Fibonacci sphere that ripples with speech and assembles itself on boot. Around it: tilted orbit rings with satellites, a segmented ring that chases while thinking, a radial voice trail (the last 1.6 s of audio), a radar sweep, a hex-lattice backdrop, and live corner telemetry (link, session timer, voice meter, state). |
+| `stark` *(default)* | `core/hud3d.py`, a 3D projection table. Seven gyroscope rings on different axes, an arc-reactor core, a perspective grid floor with a projector beam, drifting particles, an audio equalizer crown, floor sonar pulses, CPU/MEM arc gauges, a heading tape and a boot sequence. The camera orbits slowly and leans toward the mouse. |
+| `nexus` | A 340-point Fibonacci sphere with orbit rings, a voice trail, a radar sweep and corner telemetry. |
 | `face` | The original holographic head with formant-driven lip-sync and facial acting (`core/avatar.py`). |
 | `core` | The original reactor core. |
 
 Everything is drawn in software with `QPainter`, so no GPU or OpenGL is needed.
-The Nexus sphere is rotated with numpy and drawn as four depth buckets, one pen
-change each, at about 5 ms per frame.
+The Stark scene uses numpy for rotation and perspective projection, batches
+geometry into depth buckets (near is bright and thick, far is faint), draws the
+faint floor without antialiasing, and caches its background. That comes to
+about 10 ms a frame, dropping to about 10 fps when the window isn't focused.
+
+```mermaid
+flowchart LR
+    STEP["HudCanvas._step (60 Hz)<br/>audio level · visemes · state"] --> SCENE["StarkScene.step<br/>ring spin · camera orbit + mouse lean<br/>audio history · sonar pulses"]
+    SCENE --> PAINT["StarkScene.paint (10–30 Hz)"]
+    PAINT --> B1["cached background"] --> B2["floor grid + sonar (no AA)"] --> B3["projector beam · particles"] --> B4["voice crown"] --> B5["gyroscope rings (depth-bucketed)"] --> B6["arc reactor"] --> B7["gauges · heading tape · boot text"]
+```
 
 ---
 
