@@ -2427,17 +2427,24 @@ class JarvisLive:
                 f"about {round(mins / 60)} hours ago")
         how = "stopped unexpectedly" if not info.get("clean_exit") else "was restarted"
         pending = self._pending_request
+        # This message is the app talking, in English. The reply should be in
+        # the user's language — per [LANGUAGE], the one of their last message —
+        # so quote it here instead of leaving the model to infer it.
+        last_user = next((t.split(": ", 1)[-1] for t in reversed(self._recent_turns)
+                          if t.startswith("User")), "")
+        lang = (f" Speak the language of the user's last message (\"{last_user[:120]}\")."
+                if last_user else "")
         if pending:
             msg = (f"[RESUMED] The app {how} {when} and is running again; the "
                    f"conversation so far is restored. Before it stopped the user "
                    f"asked: \"{pending[:300]}\" — that was not finished. In one "
                    f"short sentence, say you are back and ask whether to carry on "
-                   f"with it. Do not start or repeat any action until they say yes.")
+                   f"with it. Do not start or repeat any action until they say yes.{lang}")
         else:
             msg = (f"[RESUMED] The app {how} {when} and is running again; the "
                    f"conversation so far is restored. In a few words, say you are "
                    f"back and ready to continue. Do not greet the user from "
-                   f"scratch and do not repeat your last answer.")
+                   f"scratch and do not repeat your last answer.{lang}")
         try:
             await self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": msg}]},
