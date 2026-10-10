@@ -6466,10 +6466,13 @@ class MainWindow(QMainWindow):
 
     def _on_setup_done(self, key: str, os_name: str):
         os.makedirs(CONFIG_DIR, exist_ok=True)
-        API_FILE.write_text(
-            json.dumps({"gemini_api_key": key, "os_system": os_name}, indent=4),
-            encoding="utf-8",
-        )
+        # Merge, never replace. This screen also reappears when a key turns out
+        # to be invalid, and writing only these two fields wiped every other
+        # setting — voice, HUD style, names, colour, plugin credentials — the
+        # moment the user typed a new key.
+        data = _read_full_config()
+        data.update({"gemini_api_key": key, "os_system": os_name})
+        API_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
         self._ready = True
         if self._overlay:
             self._overlay.hide()

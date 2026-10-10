@@ -84,6 +84,7 @@ from core                      import audio_devices
 from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
 from core.viseme               import VisemeStream
+from core                      import session_state
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
 )
@@ -731,6 +732,10 @@ class JarvisLive:
         # conversation that never ends never produces a summary, and the
         # "yesterday we talked about…" line silently disappears.
         self._resume_handle: str | None = None
+        self._resume_model: str | None = None   # handles only resume on the model that issued them
+        self._pending_request: str | None = None  # last request that never got an answer
+        self._state_dirty = False               # session_state needs writing
+        self._resume_info: dict = {}            # what the last run left behind (see end of __init__)
 
         # ── Transcript-based recovery ──────────────────────────────────
         # A resumption handle cannot survive every failure. After a 1011 the
@@ -810,6 +815,53 @@ class JarvisLive:
         self.ui.on_wake_toggle   = self._ui_wake_toggle   # (enable: bool) -> str
         self.ui.on_wake_manual   = self._ui_wake_manual   # () -> toggle awake/asleep
         self.ui.on_wake_install  = self._ui_wake_install  # () -> (ok, msg)
+
+        # ── Pick up where the last run stopped ──────────────────────────────
+        # The recent turns used to live only in RAM, so any stop — a crash, a
+        # killed process, closing it by mistake — began the next launch from
+        # nothing. Now they are on disk (core/session_state) and seed the
+        # first session of this launch. Always a clean session, never the old
+        # handle: resuming a session killed mid-answer replays that answer
+        # and can stop responding (measured; see core/session_state.py).
+        st = session_state.load()
+        if st and st.get("turns"):
+            self._resume_info = st
+            self._recent_turns.extend(st.get("turns") or [])
+            if not st.get("clean_exit"):
+                # Its session summary was never written; include these turns
+                # in the next one so the morning briefing still learns of them.
+                self._session_log.extend(st.get("turns") or [])
+            self._restore_pending = True
+            self._pending_request = st.get("pending")
+            how = "after a crash" if not st.get("clean_exit") else "after a restart"
+            print(f"[JARVIS] 🧷 Continuing the last conversation {how} "
+                  f"({st['age'] / 60:.0f} min ago, {len(st.get('turns') or [])} turns"
+                  f"{', unfinished request' if st.get('pending') else ''}).")
+
+    # ── Session state on disk ────────────────────────────────────────────────
+
+    async def _save_state(self, clean_exit: bool = False) -> None:
+        """Write the continuity state (called on the event loop thread, so the
+        snapshot can never race a turn being appended)."""
+        turns, pending = list(self._recent_turns), self._pending_request
+        self._state_dirty = False
+        await asyncio.to_thread(session_state.save, turns,
+                                None if clean_exit else pending, clean_exit)
+
+    async def _persist_loop(self) -> None:
+        """Lifetime task: flush changes within 5 s, and touch the file every
+        30 s so its timestamp says how recently the app was alive — that is
+        how the next launch tells a crash a minute ago from one yesterday."""
+        last = 0.0
+        while True:
+            await asyncio.sleep(5)
+            now = time.monotonic()
+            if self._state_dirty or now - last >= 30:
+                try:
+                    await self._save_state()
+                except Exception as e:
+                    print(f"[State] save failed: {e}")
+                last = now
 
     # ── Wake word: state machine ─────────────────────────────────────────────
 
@@ -1001,6 +1053,8 @@ class JarvisLive:
         # conversation a reconnect has to be able to restore.
         if text and not text.lstrip().startswith("["):
             self._recent_turns.append(f"User (typed): {text.strip()}")
+            self._pending_request = text.strip()
+            self._state_dirty = True
             # Typing is the user talking, as far as the briefing, proactive
             # check-ins and auto-sleep are concerned.
             self._last_user_speech = time.monotonic()
@@ -1033,6 +1087,10 @@ class JarvisLive:
         line = f"{speaker}: {text}"
         self._session_log.append(line)
         self._recent_turns.append(line)
+        # A user turn opens a request; the assistant answering closes it. If
+        # the app stops in between, the next launch knows what was unfinished.
+        self._pending_request = text if speaker.startswith("User") else None
+        self._state_dirty = True
 
     def _link(self, state: str, detail: str = "") -> None:
         """Mirror the connection state onto the HUD's link indicator."""
@@ -1590,6 +1648,7 @@ class JarvisLive:
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
                 async def _do_shutdown():
+                    await self._save_state(clean_exit=True)
                     await self._save_session_summary()
                     if self.session:
                         try:
@@ -1859,6 +1918,8 @@ class JarvisLive:
                             if self._resume_handle is None:
                                 print("[JARVIS] 🔗 Session resumption armed")
                             self._resume_handle = _sru.new_handle
+                            self._resume_model = LIVE_MODEL
+                            self._state_dirty = True
 
                     # ── GoAway ───────────────────────────────────────────────
                     # The server's notice that this connection is about to be
@@ -2335,6 +2396,113 @@ class JarvisLive:
 
         asyncio.create_task(_deliver_news())
 
+    # ── Continuing after a restart ─────────────────────────────────────────────
+
+    async def _send_resume_greeting(self, info: dict) -> None:
+        """Say we are back — and, if a request was cut off, ask before
+        finishing it. Asking rather than redoing is deliberate: the request may
+        have been half-done ("send that message", "move those files"), and
+        doing it twice is worse than checking."""
+        await asyncio.sleep(0.4)
+        if not self.session:
+            return
+        mins = int(info.get("age", 0) // 60)
+        when = ("a moment ago" if mins < 1 else
+                f"{mins} minute{'s' if mins != 1 else ''} ago" if mins < 90 else
+                f"about {round(mins / 60)} hours ago")
+        how = "stopped unexpectedly" if not info.get("clean_exit") else "was restarted"
+        pending = self._pending_request
+        if pending:
+            msg = (f"[RESUMED] The app {how} {when} and is running again; the "
+                   f"conversation so far is restored. Before it stopped the user "
+                   f"asked: \"{pending[:300]}\" — that was not finished. In one "
+                   f"short sentence, say you are back and ask whether to carry on "
+                   f"with it. Do not start or repeat any action until they say yes.")
+        else:
+            msg = (f"[RESUMED] The app {how} {when} and is running again; the "
+                   f"conversation so far is restored. In a few words, say you are "
+                   f"back and ready to continue. Do not greet the user from "
+                   f"scratch and do not repeat your last answer.")
+        try:
+            await self.session.send_client_content(
+                turns={"role": "user", "parts": [{"text": msg}]},
+                turn_complete=True,
+            )
+            print("[JARVIS] 🧷 Resume greeting sent"
+                  + (" (asking about the unfinished request)." if pending else "."))
+            self.ui.write_log("SYS: Back online — continuing the last conversation."
+                              + (" Asking about the unfinished request." if pending else ""))
+        except Exception as e:
+            print(f"[JARVIS] Resume greeting failed: {e}")
+
+    # ── Back to the main model ──────────────────────────────────────────────────
+
+    _PRIMARY_CHECK_S = 30.0       # how often a fallback session looks for the main model
+
+    async def _watch_primary(self) -> None:
+        """Session task: while a fallback model is answering, move back to the
+        main one as soon as it is usable again.
+
+        Before this, a fail-over was permanent for the run: once the main
+        model ran out of quota the assistant stayed on the backup until
+        something else happened to force a reconnect. Now, every 30 s, if a
+        better-ranked model has finished resting, it is probed with a real
+        one-line turn, and only on success is the conversation moved across —
+        in a quiet moment, carried over from the transcript."""
+        while True:
+            await asyncio.sleep(self._PRIMARY_CHECK_S)
+            try:
+                ladder = _gemini.live_ladder()
+                if LIVE_MODEL not in ladder:
+                    continue
+                better = [m for m in ladder[:ladder.index(LIVE_MODEL)]
+                          if not _gemini.is_cooling(m)]
+                if not better:
+                    continue
+                with self._speaking_lock:
+                    speaking = self._is_speaking
+                if (speaking or self._vision_busy
+                        or time.monotonic() - self._last_user_speech < 8):
+                    continue
+                target = better[0]
+                print(f"[JARVIS] 🔁 {target.split('/')[-1]} has rested — checking it…")
+                if not await self._probe_live(target):
+                    continue
+                print(f"[JARVIS] 🔁 Main model {target.split('/')[-1]} is back — switching.")
+                self.ui.write_log(f"SYS: {target.split('/')[-1]} is available again — "
+                                  f"switching back, conversation kept.")
+                self.request_reconnect(keep_context=False, reason="main model back")
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                print(f"[JARVIS] primary check failed: {e}")
+
+    async def _probe_live(self, model: str) -> bool:
+        """One tiny real turn on `model`. True if it answers; a failure is
+        recorded on the ladder (so a still-exhausted model rests again)."""
+        try:
+            client = genai.Client(api_key=_get_api_key(),
+                                  http_options={"api_version": "v1beta"})
+            cfg = types.LiveConnectConfig(response_modalities=["AUDIO"],
+                                          output_audio_transcription={})
+
+            async def _turn():
+                async with client.aio.live.connect(model=model, config=cfg) as s:
+                    await s.send_client_content(
+                        turns={"role": "user", "parts": [{"text": "Reply with: ok"}]},
+                        turn_complete=True)
+                    async for r in s.receive():
+                        if r.data or (r.server_content and r.server_content.turn_complete):
+                            return True
+                return False
+
+            return bool(await asyncio.wait_for(_turn(), 15))
+        except Exception as e:
+            _gemini.note_live_failure(model, _error_text(e))
+            print(f"[JARVIS] 🔁 {model.split('/')[-1]} still unavailable: {_error_text(e)[:120]}")
+            return False
+
     # ── Session memory ──────────────────────────────────────────────────────────
 
     async def _save_session_summary(self) -> None:
@@ -2557,6 +2725,9 @@ class JarvisLive:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
 
+        # Continuity state on disk — lifetime task, survives reconnects.
+        asyncio.create_task(self._persist_loop())
+
         while True:
             try:
                 print("[JARVIS] Connecting...")
@@ -2570,6 +2741,16 @@ class JarvisLive:
                 live_model = LIVE_MODEL
                 print(f"[JARVIS] Live model: {live_model}")
 
+                # A handle only resumes on the model that issued it. After a
+                # quota fail-over (or a restart onto a different model) the
+                # conversation moves across through the transcript instead.
+                if (self._resume_handle and self._resume_model
+                        and self._resume_model != live_model):
+                    print(f"[JARVIS] 🔗 Saved session belongs to "
+                          f"{self._resume_model.split('/')[-1]} — continuing on "
+                          f"{live_model.split('/')[-1]} from the transcript.")
+                    self._resume_handle = None
+                    self._restore_pending = True
                 _resumed_with = self._resume_handle is not None
                 _restoring    = self._restore_pending and not _resumed_with
                 config = self._build_config()
@@ -2651,15 +2832,23 @@ class JarvisLive:
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
                     tg.create_task(self._run_sleep_watch())
+                    tg.create_task(self._watch_primary())
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
 
-                    # Morning briefing — fires once per process launch (if enabled).
-                    # Skipped in wake-word mode: it comes up asleep, and a briefing
-                    # would mean talking while "asleep".
-                    if not self._briefing_sent and get_brief_enabled() and self._awake:
+                    # First session of this launch: either pick the last
+                    # conversation back up, or give the morning briefing.
+                    # Coming back from a crash — or restarting within ten
+                    # minutes — is a continuation, not a new day: no
+                    # greeting from scratch, no news. Skipped in wake-word
+                    # mode, which comes up asleep.
+                    if not self._briefing_sent and self._awake:
                         self._briefing_sent = True
-                        tg.create_task(self._send_startup_briefing())
+                        info = self._resume_info
+                        if info and (not info.get("clean_exit") or info.get("age", 1e9) < 600):
+                            tg.create_task(self._send_resume_greeting(info))
+                        elif get_brief_enabled():
+                            tg.create_task(self._send_startup_briefing())
 
             except KeyboardInterrupt:
                 raise
@@ -2725,6 +2914,13 @@ class JarvisLive:
                 if ((_gemini.is_quota_error(err_str) or (lived == 0 and not _resumed_with))
                         and _gemini.note_live_failure(live_model, err_str)):
                     nxt = _gemini.live_model()
+                    if nxt != live_model:
+                        # A different model: no handle crosses over, so the
+                        # conversation does — through the transcript. (Only
+                        # doing this when a handle existed left a fail-over in
+                        # the first seconds of a session with nothing at all.)
+                        self._resume_handle = None
+                        self._restore_pending = True
                     self.ui.write_log(
                         f"SYS: Switching to {nxt.split('/')[-1]} — the previous "
                         f"model is unavailable right now."
@@ -2745,6 +2941,8 @@ class JarvisLive:
                 # keeps happening, and tell the user in one calm line.
                 if lived >= 20:
                     self._resume_retried = False       # a healthy session ran
+                if lived >= 60:
+                    _gemini.note_live_ok(live_model)   # forget its quota strikes
                 if (_is_server_internal(e) and _resumed_with and lived < 8
                         and not self._resume_retried):
                     # A resume refused straight away. On 3.8 that is usually
@@ -2809,6 +3007,11 @@ class JarvisLive:
                     # A bare 1007 is NOT treated as a bad key any more — it is
                     # also what an unsupported field produces.
                     if "api key not valid" in low or "api_key_invalid" in low:
+                        # A new key may belong to another project, whose server
+                        # cannot resume this one's session: carry the talk over
+                        # from the transcript instead.
+                        self._resume_handle = None
+                        self._restore_pending = True
                         self.ui.write_log("ERR: API key invalid — please re-enter your key.")
                         self.ui.set_state("SLEEPING")
                         self.ui.prompt_reconfig()
@@ -2922,6 +3125,13 @@ def main():
     jarvis = holder.get("jarvis")
     loop = getattr(jarvis, "_loop", None)
     if jarvis is not None and loop is not None and loop.is_running():
+        # A deliberate close, written down — so the next launch knows it was
+        # not a crash. (No unfinished request is kept for a deliberate close.)
+        try:
+            asyncio.run_coroutine_threadsafe(
+                jarvis._save_state(clean_exit=True), loop).result(timeout=5)
+        except Exception as e:
+            print(f"[State] Could not mark a clean exit: {e}")
         try:
             fut = asyncio.run_coroutine_threadsafe(jarvis._save_session_summary(), loop)
             fut.result(timeout=15)

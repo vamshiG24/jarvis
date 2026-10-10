@@ -259,6 +259,39 @@ _GONE_SECONDS = 6 * 60 * 60
 _UNAVAILABLE_SECONDS = 30 * 60
 _cooldown: dict[str, float] = {}
 _cool_lock = threading.Lock()
+# Consecutive quota failures per model, for exponential rest (see
+# _quota_rest). Reset by note_live_ok() once the model has worked again.
+_quota_strikes: dict[str, int] = {}
+
+
+def _seconds_to_quota_reset() -> float:
+    """Seconds until Gemini's daily quotas reset: midnight US Pacific time."""
+    from datetime import datetime, timedelta, timezone
+    try:
+        from zoneinfo import ZoneInfo
+        tz = ZoneInfo("America/Los_Angeles")
+    except Exception:                          # no tz database (bare Windows)
+        tz = timezone(timedelta(hours=-8))
+    now = datetime.now(tz)
+    nxt = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return max(60.0, (nxt - now).total_seconds() + 60.0)
+
+
+def _quota_rest(model: str, err: str) -> float:
+    """How long to rest a model that ran out of quota.
+
+    A fixed five minutes was wrong both ways. A DAILY limit does not come back
+    in five minutes, so the app would fail over, wait, try the main model
+    again, fail, and fail over again — a hiccup in the conversation every five
+    minutes for the rest of the day. So a 429 that names a per-day quota rests
+    the model until the daily reset; anything else rests 5, 10, 20, 40, then
+    60 minutes on repeated strikes."""
+    low = err.lower()
+    if "perday" in low or "per_day" in low or "per day" in low or "daily" in low:
+        return _seconds_to_quota_reset()
+    n = _quota_strikes.get(model, 0) + 1
+    _quota_strikes[model] = n
+    return float(min(3600, _COOLDOWN_SECONDS * 2 ** (n - 1)))
 
 
 def _cool(model: str, seconds: float = _COOLDOWN_SECONDS) -> None:
@@ -295,6 +328,11 @@ def is_gone_error(err: str) -> bool:
             or "permission" in low or "403" in err)
 
 
+def live_ladder() -> tuple[str, ...]:
+    """The Live models in order of preference (user's choice first)."""
+    return _live_ladder()
+
+
 def live_model() -> str:
     """The Live model to open the conversation with: the first rung that is not
     resting. If every one is resting the ladder is used from the top anyway —
@@ -314,9 +352,10 @@ def note_live_failure(model: str, err: str) -> bool:
     those would work through every model and reach the same wall four times.
     """
     if is_quota_error(err):
-        _cool(model, _COOLDOWN_SECONDS)
-        print(f"[Gemini] Live model {model} is out of quota — "
-              f"switching for {_COOLDOWN_SECONDS // 60} minutes.")
+        rest = _quota_rest(model, err)
+        _cool(model, rest)
+        print(f"[Gemini] Live model {model} is out of quota — resting it "
+              f"{rest / 60:.0f} min, then the main model is tried again automatically.")
         return True
     if is_gone_error(err):
         _cool(model, _GONE_SECONDS)
@@ -324,6 +363,15 @@ def note_live_failure(model: str, err: str) -> bool:
               f"setting it aside.")
         return True
     return False
+
+
+def note_live_ok(model: str) -> None:
+    """The model has been working: forget its quota strikes."""
+    _quota_strikes.pop(model, None)
+
+
+def is_cooling(model: str) -> bool:
+    return _cooling(model)
 
 
 def _cooling(model: str) -> bool:
@@ -335,17 +383,31 @@ def _cooling(model: str) -> bool:
         return False
 
 
+_cached_key_mtime: float = -1.0
+
+
 def api_key(refresh: bool = False) -> str:
-    """The Gemini key from config/api_keys.json. Cached; never raises."""
-    global _cached_key
+    """The Gemini key from config/api_keys.json. Never raises.
+
+    Cached, but re-read whenever the file changes. It used to be cached for
+    the life of the process, so after the user entered a new key — because
+    the old one was invalid or out of quota — the conversation used the new
+    key while every side task (PDFs, search, summaries) kept failing on the
+    old one until a restart."""
+    global _cached_key, _cached_key_mtime
     with _key_lock:
-        if _cached_key is not None and not refresh:
+        try:
+            mtime = _KEY_FILE.stat().st_mtime
+        except Exception:
+            mtime = -1.0
+        if _cached_key is not None and not refresh and mtime == _cached_key_mtime:
             return _cached_key
         try:
             data = json.loads(_KEY_FILE.read_text(encoding="utf-8"))
             _cached_key = str(data.get("gemini_api_key") or "")
         except Exception:
             _cached_key = ""
+        _cached_key_mtime = mtime
         return _cached_key
 
 

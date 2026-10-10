@@ -27,6 +27,9 @@ config/whatsapp_web/
 # ── Personal data the assistant accumulates about you ─────────────────────────
 memory/long_term.json
 memory/*.db
+# The last conversation, kept so a crash or restart can continue it
+memory/session_state.json
+memory/session_state.tmp
 
 # ── Python build noise ────────────────────────────────────────────────────────
 __pycache__/
