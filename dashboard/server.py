@@ -854,7 +854,7 @@ class DashboardServer:
             ssl_keyfile=str(ssl_key), ssl_certfile=str(ssl_cert),
         )
         print(f"[Dashboard] Manual entry:  {self._ip}:{PORT + 1}  (type in browser, accept cert once)")
-        await uvicorn.Server(cfg).serve()
+        await self._run(cfg, PORT + 1)
 
     async def serve(self) -> None:
         if not _DEPS_OK:
@@ -884,4 +884,17 @@ class DashboardServer:
         proto = "https" if use_ssl else "http"
         print(f"[Dashboard] {proto}://{self._ip}:{PORT}")
         print("[Dashboard] Press 'Remote Control' in JARVIS UI to get the QR code.")
-        await uvicorn.Server(cfg).serve()
+        await self._run(cfg, PORT)
+
+    @staticmethod
+    async def _run(cfg, port: int) -> None:
+        """uvicorn answers a port it cannot bind with sys.exit(1). This server
+        runs inside the assistant's own event loop, so that exit used to end
+        the assistant — the window stayed up with nothing behind it whenever
+        port 8000 was taken (by another app, or by the previous run still
+        shutting down). Here it ends only the dashboard."""
+        try:
+            await uvicorn.Server(cfg).serve()
+        except (SystemExit, OSError):
+            print(f"[Dashboard] Port {port} is already in use — remote control is off "
+                  f"for this run. The assistant itself is unaffected.")
