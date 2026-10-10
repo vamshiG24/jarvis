@@ -257,6 +257,16 @@ model, such as `gemini-3.8-live-extended-thinking`, in front.
 | Thinking | `thinking_budget` | `thinking_level` | **no `thinking_config` allowed** (interleaved reasoning is built in) |
 | Tool calls | `behavior` as declared | sync only, so `behavior`/`scheduling` are stripped | **async by default**, so every tool is declared `BLOCKING` (a tool that asks for `NON_BLOCKING` keeps it and gets `scheduling`) |
 
+**Continuity across restarts and model changes.**
+
+| Situation | Mechanism |
+|---|---|
+| App crash, kill or restart | `core/session_state.py` keeps the last 24 turns, the unanswered request and a clean-exit flag on disk. It's written atomically within 5 s of a change and touched every 30 s. The next launch seeds a **fresh** session from it and sends a `[RESUMED]` turn that asks before finishing anything left half-done. No morning briefing after a crash. |
+| Why not the old resumption handle | Resuming a session killed mid-answer replayed that answer and sometimes stopped responding (measured on 3.8). Handles are used only for reconnects within one run. |
+| Quota on the main model | Step down the Live ladder. The handle is model-specific, so the conversation crosses over through the transcript. A per-day 429 rests the model until midnight Pacific; others rest 5 → 10 → 20 → 40 → 60 min. |
+| Main model recovers | `_watch_primary` checks every 30 s, probes the better model with one real turn, and switches back in a quiet moment with the transcript. |
+| New API key | `core/gemini.api_key()` re-reads the file when it changes, and the setup screen merges the key into the config instead of replacing it. |
+
 **3.8 resume quirk.** Right after a connection closes, 3.8 refuses a resume with
 a 1011 for about 1.5 s (gemini-live-api-examples #60). Deliberate reconnects
 therefore wait 2 s before resuming, and a resume refused at once is retried a

@@ -41,6 +41,20 @@ Also added:
 * **Calm logging.** One line per dropped connection instead of a 60-line traceback. Set `JARVIS_DEBUG=1` to get full tracebacks back.
 * **A live link indicator** in the header and HUD: `ONLINE` / `CONNECTING` / `RECOVERING` / `OFFLINE`.
 
+### 🔁 Picks up where it stopped, and never stays stuck on a backup model
+
+| Situation | What happens now |
+|---|---|
+| **The app crashes or is killed mid-conversation** | The next launch continues the same conversation: "I'm back, sir. Shall I continue with the draft about the ocean?" It asks before finishing an interrupted request instead of silently redoing it, because "send that message" twice is worse than asking. No morning briefing after a crash. |
+| **You close it and reopen within 2 hours** | The conversation is carried over. A crash counts for 6 hours. |
+| **The main model runs out of quota** | A backup Live model answers immediately, **with the conversation**. |
+| **The main model's quota comes back** | Every 30 s the app checks whether the main model has rested. If so, it tests it with one real turn and switches back at a quiet moment, conversation kept. A *daily* limit rests until Google's reset at midnight Pacific instead of failing again every 5 minutes. |
+| **You enter a new API key** | Side tasks (PDFs, search, summaries) pick it up immediately, and the setup screen no longer wipes your other settings. |
+
+Verified against the live server: a run killed mid-request, then a fresh launch, said it was back, asked about the unfinished request and still remembered a code word (3 of 3 runs).
+
+**Why restarts start a clean session instead of resuming the old one.** It was tried. A session killed while answering, when resumed from the next launch, *replayed* the half-finished answer and sometimes stopped responding. A fresh session seeded with the saved transcript answered every time.
+
 ### 🧠 Upgraded to the newest Gemini models
 
 Picked from the models **this API key actually offers** (`models.list`) and
@@ -212,6 +226,8 @@ These are the advanced keys:
 | `⚠ Gemini closed the session with 1011 …` | A Google-side error | None. The app reconnects with your conversation kept. If it repeats constantly, the service may be having an outage |
 | Header chip shows `RECOVERING` | Reconnecting after a server or quota error | Wait a few seconds |
 | `Resumption handle rejected` | The old session couldn't be resumed | None. It continues in a fresh session seeded from the transcript |
+| `🧷 Continuing the last conversation after a crash` | The previous run stopped unexpectedly | None. It will say it's back and ask about anything unfinished |
+| `Live model … is out of quota — resting it N min` | The main model hit its limit; a backup is answering | None. It switches back by itself when the main model recovers |
 | `[Audio] output: directsound accepts audio but never plays it …` | The startup probe found a silent audio backend and skipped it | None. This is expected on Windows; it picks a working one (MME) |
 | Log ends without `Window closed` | The process died instead of being closed | Copy the `Fatal Python error` / traceback that `faulthandler` printed into a bug report |
 | `[Gemini] …: ReadError … forcibly closed by the remote host` | The network dropped a request | None. The ladder retries on the next model. If it happens often, check your network or VPN |
@@ -253,6 +269,7 @@ Everything stays on your machine. There's no server, telemetry or account.
 | Gemini key, plugin credentials | `config/api_keys.json` | **Plaintext.** Treat it like a password file |
 | Dashboard TLS key and certificate | `config/certs/` | Self-signed and generated locally |
 | What the assistant remembers | `memory/long_term.json` | Delete it to make the assistant forget everything |
+| The last conversation (for continuing after a crash or restart) | `memory/session_state.json` | Plain text, the last 24 lines. Ignored after 6 h (crash) or 2 h (normal close). Delete it to start fresh |
 
 All three are git-ignored (this build fixed the rules that silently didn't
 work). **If you ever pushed `config/api_keys.json` anywhere, revoke the key** at
