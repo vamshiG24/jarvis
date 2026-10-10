@@ -107,7 +107,7 @@ PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
 #
 # It is reassigned on every connect, so a model that runs out of quota is
 # stepped over and the assistant keeps talking instead of failing to start.
-LIVE_MODEL          = "models/gemini-3.1-flash-live-preview"
+LIVE_MODEL          = "models/gemini-3.8-live"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000 
 RECEIVE_SAMPLE_RATE = 24000
@@ -610,16 +610,46 @@ def _mentions_resumption(text: str) -> bool:
     return bool(_RESUME_RE.search(text or ""))
 
 
-def _is_gen3_live(model: str) -> bool:
-    """gemini-3.x Live models accept a narrower config than the 2.5 ones.
+def _live_version(model: str) -> tuple[int, int]:
+    """'models/gemini-3.8-live' → (3, 8). (0, 0) when there is no version."""
+    m = re.search(r"gemini-(\d+)(?:\.(\d+))?", (model or "").lower())
+    return (int(m.group(1)), int(m.group(2) or 0)) if m else (0, 0)
 
-    Per Google's model page for gemini-3.1-flash-live-preview: function calling
-    is synchronous only (no NON_BLOCKING / scheduling), proactive audio and
-    affective dialog are not supported, and thinking is set with
-    `thinking_level` rather than `thinking_budget`. Sending the unsupported
-    fields does not always fail at connect time — which is exactly why they are
-    worth removing: they can fail later, mid-conversation, instead."""
-    return "gemini-3" in (model or "").lower()
+
+def _is_gen3_live(model: str) -> bool:
+    return _live_version(model) >= (3, 0)
+
+
+def _live_caps(model: str) -> dict:
+    """Which session fields a Live model accepts — by generation, because the
+    generations disagree, sometimes in opposite directions.
+
+    Sending a field a model does not take does not always fail at connect
+    time, which is exactly why this matters: it can fail later, mid-
+    conversation, as a 1011. From Google's model pages:
+
+      2.5 native audio   proactive audio + affective dialog configurable;
+                         thinking_budget; tools may be NON_BLOCKING.
+      3.1 flash live     no proactive/affective config; thinking_level;
+                         function calling synchronous only — no `behavior`,
+                         no `scheduling`.
+      3.8 live (stable)  proactive audio always ON (proactive_audio:false is
+                         an error); NO thinking config at all; async
+                         (NON_BLOCKING) is the DEFAULT, so every tool must be
+                         declared BLOCKING to keep the wait-for-the-result
+                         behaviour this app — and its vision flow — is built
+                         on; scheduling supported. Later 3.x models are
+                         assumed to follow 3.8.
+    """
+    v = _live_version(model)
+    if v >= (3, 8):
+        return {"gen3": True, "proactive_field": False, "thinking": None,
+                "tool_behavior": "BLOCKING", "scheduling": True}
+    if v >= (3, 0):
+        return {"gen3": True, "proactive_field": False, "thinking": "level",
+                "tool_behavior": "strip", "scheduling": False}
+    return {"gen3": False, "proactive_field": True, "thinking": "budget",
+            "tool_behavior": "keep", "scheduling": True}
 
 
 def _parse_seconds(value, default: float = 10.0) -> float:
@@ -717,6 +747,7 @@ class JarvisLive:
         self._conn_backoff    = 3
         self._go_away_pending = False   # a GoAway refresh is already scheduled
         self._first_session   = True    # the next connect is the app's first
+        self._resume_retried  = False   # one delayed resume retry already spent
         self._reset_tool_turn()         # loop-guard counters (see _loop_guard)
         self._wants_alpha     = False   # set by _build_config: v1alpha-only fields in use
         self._turn_done_event: asyncio.Event | None = None
@@ -1207,7 +1238,8 @@ class JarvisLive:
         )
 
         model = LIVE_MODEL
-        gen3  = _is_gen3_live(model)
+        caps  = _live_caps(model)
+        gen3  = caps["gen3"]
 
         # Everything the model is told about *itself* is derived here, not
         # written into prompt.txt: the name comes from config, the platform from
@@ -1217,12 +1249,24 @@ class JarvisLive:
         _all_decls = (TOOL_DECLARATIONS
                       + self._action_registry.get_tool_declarations()
                       + self._plugin_registry.get_tool_declarations())
-        if gen3:
-            # Async (NON_BLOCKING) function calling is not supported on 3.x
-            # Live — calls are synchronous only. A plugin that asked for it
-            # still works; it just runs the ordinary blocking way.
+        if caps["tool_behavior"] == "strip":
+            # 3.1: function calling is synchronous only. A plugin that asked
+            # for NON_BLOCKING still works; it just runs the blocking way.
             _all_decls = [{k: v for k, v in d.items() if k != "behavior"}
                           if isinstance(d, dict) else d for d in _all_decls]
+        elif caps["tool_behavior"] == "BLOCKING":
+            # 3.8+: async is the default, so wait-for-the-result has to be
+            # asked for explicitly. A tool that declared NON_BLOCKING itself
+            # keeps it — that one was designed for it.
+            _all_decls = [dict(d, behavior=("NON_BLOCKING"
+                                            if d.get("behavior") == "NON_BLOCKING"
+                                            else "BLOCKING"))
+                          if isinstance(d, dict) else d for d in _all_decls]
+        # Which tools really run async this session — only those get a
+        # `scheduling` hint in their response (see _execute_tool).
+        self._nonblocking_tools = {
+            d.get("name") for d in _all_decls
+            if isinstance(d, dict) and d.get("behavior") == "NON_BLOCKING"}
         _names = {(d.get("name") if isinstance(d, dict) else getattr(d, "name", ""))
                   for d in _all_decls}
         try:
@@ -1300,18 +1344,20 @@ class JarvisLive:
         # to it. 2.5 native-audio only — gemini-3.x Live does not support it
         # (nor affective dialog), and Google's migration notes say to remove the
         # config rather than rely on the server ignoring it.
-        if self._enhanced_live and not gen3 and get_proactive_audio_enabled():
+        # (3.8 has it permanently on and rejects the field, so it is never sent
+        # there either.)
+        if self._enhanced_live and caps["proactive_field"] and get_proactive_audio_enabled():
             cfg["proactivity"] = types.ProactivityConfig(proactive_audio=True)
         # v1alpha is only needed to carry `proactivity`; everything else here is
         # stable on v1beta, which is where the 3.x Live models are documented.
         self._wants_alpha = "proactivity" in cfg
 
         if self._tuned_live:
-            cfg.update(self._tuning_config(gen3))
+            cfg.update(self._tuning_config(caps))
 
         return types.LiveConnectConfig(**cfg)
 
-    def _tuning_config(self, gen3: bool = False) -> dict:
+    def _tuning_config(self, caps: dict | None = None) -> dict:
         """The optional knobs, kept apart so one bad field can be dropped wholesale.
 
         Every one of these is a preview-API field. If a future model release
@@ -1360,14 +1406,16 @@ class JarvisLive:
         # way for a future release to behave differently. Set "thinking_enabled"
         # in config/api_keys.json to true to let it reason instead.
         #
-        # 3.x Live replaced the token budget with a level (its default is
-        # "minimal"); sending `thinking_budget` to it is a field it no longer
-        # documents, so each family gets the field it actually reads.
+        # Each generation reads a different field: 2.5 a token budget, 3.1 a
+        # level, and 3.8 neither — it reasons on its own ("interleaved") and
+        # rejects any thinking_config; deeper reasoning there is a different
+        # model, gemini-3.8-live-extended-thinking (set "live_model").
+        caps = caps or _live_caps(LIVE_MODEL)
         if get_thinking_enabled():
-            if gen3:
+            if caps["thinking"] == "level":
                 out["thinking_config"] = types.ThinkingConfig(
                     thinking_level=types.ThinkingLevel.LOW)
-            else:
+            elif caps["thinking"] == "budget":
                 out["thinking_config"] = types.ThinkingConfig(thinking_budget=-1)
 
         return out
@@ -1600,12 +1648,13 @@ class JarvisLive:
         # something like a phone call already ringing, is exactly the noise the
         # non-blocking call was meant to avoid. Tools that declared nothing get
         # the API default and behave as they always have.
-        # 3.x Live has no async function calling, so it has nothing to schedule
-        # either — the field is only sent where it means something.
+        # Scheduling only means something for a call that actually ran async
+        # this session — and 3.1 has no async calls at all.
         _sched = (self._action_registry.scheduling(name)
                   or self._plugin_registry.scheduling(name))
         _extra = ({"scheduling": _sched}
-                  if _sched and not _is_gen3_live(LIVE_MODEL) else {})
+                  if _sched and _live_caps(LIVE_MODEL)["scheduling"]
+                  and name in getattr(self, "_nonblocking_tools", set()) else {})
         return types.FunctionResponse(
             id=fc.id, name=name,
             response={"result": result},
@@ -2648,6 +2697,13 @@ class JarvisLive:
                         # transcript instead.
                         self._resume_handle = None
                         self._restore_pending = True
+                    elif self._resume_handle:
+                        # gemini-3.8-live refuses a resume (1011) for about a
+                        # second and a half after the old connection closes —
+                        # measured and reported upstream (gemini-live-api-
+                        # examples #60). Resuming instantly just burns the
+                        # handle; a short pause keeps the server's context.
+                        await asyncio.sleep(2.0)
                     self._conn_backoff = 0
                     self._quick_failures = 0
                     continue
@@ -2687,7 +2743,22 @@ class JarvisLive:
                 # original report). So: never resume after a 1011. Start a fresh
                 # session seeded from the transcript, back off gently if it
                 # keeps happening, and tell the user in one calm line.
-                if _is_server_internal(e):
+                if lived >= 20:
+                    self._resume_retried = False       # a healthy session ran
+                if (_is_server_internal(e) and _resumed_with and lived < 8
+                        and not self._resume_retried):
+                    # A resume refused straight away. On 3.8 that is usually
+                    # the server still holding the old connection, not a
+                    # poisoned session — one retry after a pause keeps the
+                    # full server-side context. A second refusal falls through
+                    # to the fresh-session path below.
+                    self._resume_retried = True
+                    self._conn_backoff = 2
+                    print("[JARVIS] 🔗 Resume refused (1011) — the server may still hold "
+                          "the old connection; retrying once in 2s.")
+                    self._link("RECOVERING", "resuming")
+                elif _is_server_internal(e):
+                    self._resume_retried = False
                     self._resume_handle = None
                     self._restore_pending = True
                     delay = (1, 2, 5, 10, 20, 30)[min(self._quick_failures, 6) - 1]

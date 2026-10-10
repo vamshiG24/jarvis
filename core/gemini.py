@@ -116,68 +116,91 @@ LIVE = "live"
 # Every model this key can reach, in the order to try them. A rung that runs
 # out of quota is skipped for a while and the next one answers — which is the
 # whole point: one model a day means one daily limit, a ladder means the sum of
-# them. Names verified against the live model list rather than guessed.
-# Order is measured, not assumed. Timed against this key, same prompt:
-#     gemini-3.5-flash-lite      0.56s      gemini-2.5-flash        0.67s
-#     gemini-3.1-flash-lite      0.60s      gemini-2.5-flash-lite   0.74s
-#     gemini-flash-lite-latest   0.60s      gemini-3.5-flash        1.13s
-#     gemini-3-flash-preview     504, after 14.7s of waiting
-#     gemini-3.6-flash           504, after 12.0s
-#     gemini-flash-latest        503 UNAVAILABLE
-# The three that fail sit at the BOTTOM rather than being deleted: they are
-# real quota when they are healthy, and a rung that is down is set aside by the
-# cooldown after one attempt instead of being paid for on every call.
+# them. Names verified against the key's own model list (models.list), not
+# guessed. Order is MEASURED, re-run on 2026-10-10 against this key:
+#
+#   short JSON reply (best of 2)        scanned 6-page lecture PDF
+#     gemini-2.5-flash-lite   0.80s       gemini-2.5-flash-lite    9.5s
+#     gemini-2.5-flash        0.98s       gemini-3.1-flash-lite   12.3s
+#     gemini-3.1-flash-lite   0.99s       gemini-3.8-flash        75.5s
+#     gemini-3.5-flash        1.99s
+#     gemini-3.6-flash        2.29s     grounded search (google_search tool)
+#     gemini-flash-latest     2.40s       gemini-2.5-flash   4.4s, 2 sources
+#     gemini-3.8-flash        2.48s       gemini-3.8-flash   429 on free tier
+#     gemini-3.7-flash        2.55s
+#     gemini-3.5-flash-lite   6.19s     gemini-3.1-pro-preview,
+#     gemini-flash-lite-latest 6.90s      gemini-pro-latest: 429 (no free quota)
+#
+# The newest model leads wherever it is the right tool: gemini-3.8-flash heads
+# the reasoning ladder. Where it measured badly for the job — 75 s on a PDF
+# inside a voice turn, no grounding quota on the free tier — the measured
+# winner leads and 3.8 stays further down, so a key that does have the quota
+# still reaches it. Lite models whose answers arrived in markdown fences
+# (2.5) sit behind the 3.x lite one for the FAST ladder, which mostly asks for
+# raw JSON.
 _LADDERS = {
     FAST: (LIVE,
-           "gemini-2.5-flash-lite", "gemini-3.5-flash-lite",
-           "gemini-3.1-flash-lite", "gemini-flash-lite-latest",
-           "gemini-2.5-flash", "gemini-3.5-flash",
-           "gemini-3.6-flash", "gemini-3-flash-preview"),
+           "gemini-3.1-flash-lite", "gemini-2.5-flash-lite",
+           "gemini-3.8-flash", "gemini-2.5-flash", "gemini-3.5-flash",
+           "gemini-flash-latest", "gemini-3.5-flash-lite", "gemini-flash-lite-latest"),
     SMART: (LIVE,
-            "gemini-2.5-flash", "gemini-3.5-flash",
-            "gemini-2.5-flash-lite", "gemini-3.5-flash-lite",
-            "gemini-3.1-flash-lite",
-            "gemini-3.6-flash", "gemini-3-flash-preview", "gemini-flash-latest"),
+            "gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash",
+            "gemini-2.5-flash", "gemini-3.1-flash-lite", "gemini-flash-latest",
+            "gemini-2.5-flash-lite"),
     # Grounded search needs response.candidates[...].grounding_metadata, which a
     # Live turn does not produce. REST only, and it says so rather than silently
     # returning an answer with no sources behind it.
-    SEARCH: ("gemini-2.5-flash", "gemini-3.5-flash", "gemini-2.5-flash-lite",
-             "gemini-flash-latest"),
+    SEARCH: ("gemini-2.5-flash", "gemini-3.8-flash", "gemini-3.5-flash",
+             "gemini-flash-latest", "gemini-2.5-flash-lite"),
 }
 # Whole documents (a PDF passed as application/pdf). The Live API takes text,
 # images, audio and video but not document parts, so there is no Live rung —
-# REST models read PDFs natively, scanned pages included. Lite models lead:
-# measured on a 6-page scanned lecture PDF, gemini-2.5-flash-lite summarised it
-# in 10 s against 29 s for gemini-2.5-flash, and this runs inside a live voice
-# turn where every second is silence (and long tool calls are a 1011 risk).
+# REST models read PDFs natively, scanned pages included. Lite models lead
+# (see the PDF column above): this runs inside a live voice turn, where every
+# second is silence and long tool calls are a 1011 risk.
 DOCUMENT = "document"
 _LADDERS[DOCUMENT] = ("gemini-2.5-flash-lite", "gemini-3.1-flash-lite",
-                      "gemini-3.5-flash-lite", "gemini-flash-lite-latest",
-                      "gemini-2.5-flash", "gemini-3.5-flash",
-                      "gemini-3.6-flash", "gemini-flash-latest")
+                      "gemini-3.5-flash", "gemini-2.5-flash",
+                      "gemini-3.8-flash", "gemini-flash-latest")
 
-# The conversation's own model, and ONE careful fallback behind it.
+# The conversation's own model, and careful fallbacks behind it.
 #
-# Deliberately not a long ladder. The Live quota is not the one that runs out —
-# the text models are — and Live models are not interchangeable the way text
-# models are: they differ in which config fields they accept and in what they
-# can do, so falling through a list of them risks connecting to something that
-# behaves like a different assistant. The key also offers transcribe-live,
-# live-translate and a robotics streaming model, none of which are assistants
-# at all.
+# Deliberately short. Live models are not interchangeable the way text models
+# are: they differ in which config fields they accept (see _live_caps in
+# main.py) and in what they can do, and the key also offers transcribe-live,
+# live-translate and robotics streaming models that are not assistants at all.
 #
-# So there are two: the current one, and the native-audio model this assistant
-# used before it, which is known to work here. A mismatch in config is already
-# survivable — the connect loop drops the tuning and proactive-audio fields and
-# reconnects when the server rejects them.
+#   gemini-3.8-live       — newest, and stable (not preview). Leads.
+#   3.1 flash live        — the model before it, known to work here.
+#   2.5 native audio      — the one before that.
+#
+# "live_model" in config/api_keys.json puts a model of your choosing in front —
+# e.g. "gemini-3.8-live-extended-thinking" for deeper reasoning at the cost of
+# a slower first word.
 LIVE_MODELS = (
+    "models/gemini-3.8-live",
     "models/gemini-3.1-flash-live-preview",
     "models/gemini-2.5-flash-native-audio-preview-12-2025",
 )
 
 # The Live model to use for one-shot calls. main.py owns the real one; this is
 # only the fallback for when this module is imported without it (tests).
-_LIVE_FALLBACK = "models/gemini-3.1-flash-live-preview"
+_LIVE_FALLBACK = "models/gemini-3.8-live"
+
+
+def _live_ladder() -> tuple[str, ...]:
+    """LIVE_MODELS, with the user's "live_model" choice (if any) in front."""
+    try:
+        data = json.loads(_KEY_FILE.read_text(encoding="utf-8"))
+        want = str(data.get("live_model") or "").strip()
+    except Exception:
+        want = ""
+    if not want:
+        return LIVE_MODELS
+    if not want.startswith("models/"):
+        want = "models/" + want
+    return (want,) + tuple(m for m in LIVE_MODELS if m != want)
+
 
 # How many one-shot Live sessions may exist at once.
 #
@@ -276,10 +299,11 @@ def live_model() -> str:
     """The Live model to open the conversation with: the first rung that is not
     resting. If every one is resting the ladder is used from the top anyway —
     refusing to connect at all is never the better answer."""
-    for m in LIVE_MODELS:
+    ladder = _live_ladder()
+    for m in ladder:
         if not _cooling(m):
             return m
-    return LIVE_MODELS[0]
+    return ladder[0]
 
 
 def note_live_failure(model: str, err: str) -> bool:
