@@ -163,6 +163,20 @@ _LADDERS[DOCUMENT] = ("gemini-2.5-flash-lite", "gemini-3.1-flash-lite",
                       "gemini-3.5-flash", "gemini-2.5-flash",
                       "gemini-3.8-flash", "gemini-flash-latest")
 
+# Structured output — a model that must return a JSON document (a hologram
+# scene: dozens of objects, hundreds of numbers). REST only: a Live turn can
+# only SPEAK its answer, and a scene read out through transcription is slow
+# and fragile. Measured on real hologram requests (2026-10-10): gemini-3.1-flash-lite
+# designs a usable scene in ~2.5 s (7-10 parts); gemini-3.8-flash a far richer
+# one (26-56 parts, labelled) in 15-35 s. So the fast one answers and the rich
+# one refines it in the background — see actions/holo_show.py.
+STRUCTURED = "structured"
+_LADDERS[STRUCTURED] = ("gemini-3.1-flash-lite", "gemini-2.5-flash-lite", "gemini-3.5-flash",
+                        "gemini-3.8-flash", "gemini-flash-latest")
+STRUCTURED_RICH = "structured_rich"
+_LADDERS[STRUCTURED_RICH] = ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash",
+                             "gemini-2.5-flash")
+
 # The conversation's own model, and careful fallbacks behind it.
 #
 # Deliberately short. Live models are not interchangeable the way text models

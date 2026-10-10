@@ -68,6 +68,9 @@ try:
 except Exception:      # pragma: no cover — HUD must never die over cosmetics
     HoloAvatar = None
 
+from core.holo3d import HoloView
+from core import hands as _hands_mod
+
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -562,6 +565,12 @@ class HudCanvas(QWidget):
         self.skills_loaded = 0        # set from main once the registries are built
         self.online_at   = 0.0        # when the link first came up — ends the boot screen
 
+        # The hologram on screen (if any) and the hands driving it.
+        self.holo = HoloView()
+        self.hand_cursors: list[tuple] = []   # (x, y, gripping, live) — x, y 0..1
+        self.hands_on = False
+        self._holo_close_rect = QRectF()
+
         # ── Stark (3D) state ─────────────────────────────────────────────────
         # The canvas now sits behind the WHOLE window, so every style draws
         # into the "core area" between the side panels. The window provides
@@ -752,7 +761,9 @@ class HudCanvas(QWidget):
         # starts talking. Same lesson the head's sway taught.
         self._core_phase += min(0.10, max(0.0, dt))
 
+        self.holo.step(dt)
         if self._stark is not None and self.hud_style == "stark":
+            self._stark.focus_target = 1.0 if self.holo.active else 0.0
             self._stark.step(dt, amp, self.state, self.speaking, self.muted,
                              self._mouse_lean())
 
@@ -804,7 +815,7 @@ class HudCanvas(QWidget):
         # so a sleeping HUD stops pinning a CPU core. The visuals stay smooth
         # either way because the animation state keeps stepping at 60 Hz.
         self._paint_tick = (self._paint_tick + 1) % 6
-        active = (self.speaking or amp > 0.02
+        active = (self.speaking or amp > 0.02 or self.holo.active
                   or self.state in ("THINKING", "PROCESSING")
                   # Nexus and Stark assemble themselves on boot — full rate
                   # for that, then back to the idle rate like the others.
@@ -830,6 +841,42 @@ class HudCanvas(QWidget):
             # so it picks up mid-motion instead of snapping when you come back.
             if self._on_screen():
                 self.update()
+
+    def _paint_hologram(self, p: QPainter, area: QRectF) -> None:
+        """The hologram, its close chip, the control hint and hand cursors."""
+        if self.holo.active:
+            self.holo.paint(p, area, qcol(C.PRI), qcol(C.WHITE))
+            r = QRectF(area.right() - 168, area.top() + 66, 150, 24)
+            self._holo_close_rect = r
+            p.setPen(QPen(qcol(C.RED, 200), 1))
+            p.setBrush(QBrush(qcol(C.RED, 30)))
+            p.drawRoundedRect(r, 12, 12)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setFont(_mono(8, QFont.Weight.Bold))
+            p.setPen(QPen(qcol(C.RED), 1))
+            p.drawText(r, Qt.AlignmentFlag.AlignCenter, "✕  CLOSE HOLOGRAM")
+            p.setFont(_mono(7.5))
+            p.setPen(QPen(qcol(C.TEXT_DIM), 1))
+            hint = ("PINCH + MOVE  ROTATE  ·  FIST + MOVE  DRAG  ·  TWO-HAND PINCH  SCALE"
+                    if self.hands_on
+                    else "DRAG  ROTATE  ·  RIGHT-DRAG  MOVE  ·  SCROLL  ZOOM  ·  DOUBLE-CLICK  RESET")
+            st = self.holo.stage(area)
+            p.drawText(QRectF(area.left(), st.bottom() + 6, area.width(), 16),
+                       Qt.AlignmentFlag.AlignCenter, hint)
+        else:
+            self._holo_close_rect = QRectF()
+        # Hand cursors — where the webcam sees your fingertips.
+        for x, y, pinch, live in list(self.hand_cursors or []):
+            cx = area.left() + x * area.width()
+            cy = area.top() + y * area.height()
+            col = qcol(C.GOLD) if pinch else qcol(C.PRI)
+            k = 1.0 if live else 0.35        # a resting hand drives nothing
+            p.setPen(QPen(QColor(col.red(), col.green(), col.blue(), int(220 * k)), 2))
+            p.setBrush(QBrush(QColor(col.red(), col.green(), col.blue(),
+                                     int((70 if pinch else 25) * k))))
+            rad = 9 if pinch else 13
+            p.drawEllipse(QPointF(cx, cy), rad, rad)
+            p.setBrush(Qt.BrushStyle.NoBrush)
 
     def core_area(self) -> QRectF:
         """Where the centrepiece goes, in canvas coordinates."""
@@ -1422,6 +1469,8 @@ class HudCanvas(QWidget):
             # The boot sequence carries its own status line.
             if not self._stark.booting():
                 self._paint_status(p, W, H - 78)
+            p.resetTransform()
+            self._paint_hologram(p, area)
             p.end()
             return
 
@@ -1486,6 +1535,9 @@ class HudCanvas(QWidget):
                 self._paint_core(p, cx, _band_t + _band_h / 2.0, _r, W, _band_h)
 
         self._paint_status(p, W, _sy_status)
+
+        p.resetTransform()
+        self._paint_hologram(p, area)
 
         p.end()   # end deterministically so the backing store never flushes an active painter
 
@@ -1653,6 +1705,66 @@ class _OpaqueBar(QWidget):
         g.setColorAt(1.0, a if self._flip else b)
         p.fillRect(self.rect(), QBrush(g))
         p.end()
+
+
+class _HoloInput(QWidget):
+    """The transparent centre of the window — the HUD shows through it — and
+    the surface the mouse handles holograms on. With no hologram on screen it
+    does nothing at all."""
+
+    def __init__(self, hud: "HudCanvas"):
+        super().__init__()
+        self.hud = hud
+        self._last = None
+        self._btn = None
+        self.setMouseTracking(True)
+
+    def _canvas_pos(self, e) -> QPointF:
+        pt = self.mapTo(self.hud.parentWidget(), e.position().toPoint())
+        return QPointF(pt)
+
+    def mousePressEvent(self, e):
+        if not self.hud.holo.active:
+            return super().mousePressEvent(e)
+        if self.hud._holo_close_rect.contains(self._canvas_pos(e)):
+            self.hud.holo.close()
+            return
+        self._last = e.position()
+        self._btn = e.button()
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def mouseMoveEvent(self, e):
+        if not self.hud.holo.active:
+            self.unsetCursor()
+            return
+        if self._last is None:
+            over_close = self.hud._holo_close_rect.contains(self._canvas_pos(e))
+            self.setCursor(Qt.CursorShape.PointingHandCursor if over_close
+                           else Qt.CursorShape.OpenHandCursor)
+            return
+        d = e.position() - self._last
+        self._last = e.position()
+        if self._btn == Qt.MouseButton.LeftButton and not (
+                e.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            self.hud.holo.rotate(d.x() * 0.011, d.y() * 0.011)
+        else:
+            self.hud.holo.move(d.x(), d.y())
+        self.hud.update()
+
+    def mouseReleaseEvent(self, e):
+        self._last = None
+        if self.hud.holo.active:
+            self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def wheelEvent(self, e):
+        if self.hud.holo.active:
+            self.hud.holo.zoom(1.12 ** (e.angleDelta().y() / 120.0))
+            self.hud.update()
+
+    def mouseDoubleClickEvent(self, e):
+        if self.hud.holo.active:
+            self.hud.holo.reset()
+            self.hud.update()
 
 
 class _DragBar(_OpaqueBar):
@@ -3791,6 +3903,11 @@ class MainWindow(QMainWindow):
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
     _link_sig       = pyqtSignal(str, str)   # (state, detail) — live link indicator
     _startup_sig    = pyqtSignal(int, int)   # (skills loaded, memory facts)
+    _holo_sig       = pyqtSignal(object, int)      # (HoloModel, request id)
+    _holo_refine_sig = pyqtSignal(object, int)
+    _holo_cmd_sig   = pyqtSignal(str, float)       # (action, amount)
+    _hands_sig      = pyqtSignal(object, object)   # (hands seen, gesture ops)
+    _hands_state_sig = pyqtSignal(bool, str)       # (running, error)
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -4022,7 +4139,7 @@ class MainWindow(QMainWindow):
         # Stack: 0 = animated HUD, 1 = live camera, 2 = video
         # Slot 0 is an empty, transparent window onto the HUD canvas behind
         # the whole interface; the canvas centres the scene on this slot.
-        self._hud_slot = QWidget()
+        self._hud_slot = _HoloInput(self.hud)
         self._hud_cam_stack = QStackedWidget()
         self._hud_cam_stack.addWidget(self._hud_slot)
         self._hud_cam_stack.addWidget(_cam_cont)
@@ -4052,6 +4169,12 @@ class MainWindow(QMainWindow):
 
         root.addLayout(body, stretch=1)
         root.addWidget(self._build_footer())
+
+        # Hand control: owns the webcam only while switched on. Built before
+        # the controls drawer, whose switch reads it.
+        self._hands = _hands_mod.HandTracker(
+            on_frame=lambda h, ops: self._hands_sig.emit(h, ops),
+            on_state=lambda on, err: self._hands_state_sig.emit(on, err))
 
         # Quick-access drawer (floating overlay, built after central widget layout is done)
         self._quick_drawer = self._build_quick_drawer()
@@ -4092,6 +4215,11 @@ class MainWindow(QMainWindow):
         self._review_sig.connect(self._show_review)
         self._link_sig.connect(self._on_link_status)
         self._startup_sig.connect(self._on_startup_info)
+        self._holo_sig.connect(self._on_holo_show)
+        self._holo_refine_sig.connect(self._on_holo_refine)
+        self._holo_cmd_sig.connect(self._on_holo_cmd)
+        self._hands_sig.connect(self._on_hands)
+        self._hands_state_sig.connect(self._on_hands_state)
         self._cam_stop = threading.Event()
 
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
@@ -4155,6 +4283,14 @@ class MainWindow(QMainWindow):
     def _cam_loop(self) -> None:
         try:
             import cv2
+            if self._hands.running:
+                # Hand control holds the webcam — show what it sees.
+                while not self._cam_stop.wait(0.033) and self._hands.running:
+                    frame = _hands_mod.latest_frame()
+                    if frame is not None:
+                        _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                        self._cam_frame_sig.emit(buf.tobytes())
+                return
             # Reuse camera index detected by screen_processor (cached in api_keys.json)
             cam_idx = 0
             try:
@@ -4992,6 +5128,102 @@ class MainWindow(QMainWindow):
         if self._skills_count:
             self._set_chip(self._chip_skills, f"{self._skills_count} SKILLS{facts}", C.PRI)
 
+    # ── holograms ────────────────────────────────────────────────────────────
+    def _on_holo_show(self, model, rid: int) -> None:
+        self.hud.holo.show(model, rid)
+        self.hud.update()
+        self._log.append_log(f"SYS: Hologram — {model.title} ({model.size_text}).")
+
+    def _on_holo_refine(self, model, rid: int) -> None:
+        if self.hud.holo.replace_model(model, rid):
+            self._log.append_log(f"SYS: Hologram refined — {model.title} ({model.size_text}).")
+
+    def _on_holo_cmd(self, action: str, amount: float) -> None:
+        import math as _m
+        hv = self.hud.holo
+        deg = _m.radians(amount or 45.0)
+        fac = amount if 1.0 < amount <= 5.0 else 1.4   # zoom factor, never inverted
+        if action == "rotate_left":
+            hv.rotate(-deg, 0)
+        elif action == "rotate_right":
+            hv.rotate(deg, 0)
+        elif action == "rotate_up":
+            hv.rotate(0, -deg)
+        elif action == "rotate_down":
+            hv.rotate(0, deg)
+        elif action == "zoom_in":
+            hv.zoom(fac)
+        elif action == "zoom_out":
+            hv.zoom(1.0 / fac)
+        elif action == "spin_on":
+            hv.auto_spin, hv.last_touch = True, 0.0
+        elif action == "spin_off":
+            hv.auto_spin = False
+        elif action == "reset":
+            hv.reset()
+        elif action == "close":
+            hv.close()
+        self.hud.update()
+
+    # ── hand control ─────────────────────────────────────────────────────────
+    def _on_hands(self, hands, ops) -> None:
+        hud = self.hud
+        hud.hand_cursors = [(h.x, h.y, h.pinch or h.fist, h.live) for h in hands]
+        hv = hud.holo
+        if hv.active and ops:
+            area = hud.core_area()
+            for op in ops:
+                if op[0] == "rotate":
+                    hv.rotate(op[1], op[2])
+                elif op[0] == "move":
+                    hv.move(op[1] * area.width(), op[2] * area.height())
+                elif op[0] == "zoom":
+                    hv.zoom(op[1])
+                elif op[0] == "roll":
+                    hv.roll(op[1])
+        hud.update()
+
+    def _on_hands_state(self, on: bool, err: str) -> None:
+        self.hud.hands_on = on
+        if not on:
+            self.hud.hand_cursors = []
+        if on:
+            self._log.append_log("SYS: Hand control on — pinch and move to rotate, "
+                                 "fist to drag, two-hand pinch to scale. The webcam "
+                                 "stays on this computer.")
+        elif err:
+            self._log.append_log(f"SYS: Hand control stopped: {err}")
+        else:
+            self._log.append_log("SYS: Hand control off — webcam released.")
+        self._refresh_hands_btn()
+        self.hud.update()
+
+    def _toggle_hands(self) -> None:
+        if self._hands.running:
+            self._hands.stop()
+        else:
+            self._cam_stop.set()            # the camera panel would hold the device
+            self._hands.start()
+            self._hands_btn.setText("✋  HAND CONTROL: STARTING…")
+
+    def _refresh_hands_btn(self) -> None:
+        if not hasattr(self, "_hands_btn"):
+            return
+        on = self._hands.running
+        self._hands_btn.setText("✋  HAND CONTROL: ON" if on else "✋  HAND CONTROL: OFF")
+        # Same on/off look as the other switches in this drawer.
+        self._hands_btn.setStyleSheet(f"""
+            QPushButton {{ background: {'#001a08' if on else 'transparent'};
+                color: {C.GREEN if on else C.TEXT_DIM};
+                border: 1px solid {C.GREEN_D if on else C.BORDER}; border-radius: 3px;
+                text-align: left; padding: 0 8px; }}
+            QPushButton:hover {{ color: {C.GREEN if on else C.TEXT};
+                border: 1px solid {C.GREEN_D if on else C.BORDER_B}; }}""")
+        self._hands_btn.setToolTip(
+            "Move holograms with your hands through the webcam — processed on "
+            "this computer, nothing recorded. Pinch + move rotates, fist + move "
+            "drags, two-hand pinch scales.")
+
     def _on_startup_info(self, tools: int, facts: int) -> None:
         """Slot: what the assistant actually loaded at startup."""
         self._skills_count = int(tools)
@@ -5224,6 +5456,10 @@ class MainWindow(QMainWindow):
         self._hud_btn = _row(QPushButton())
         self._hud_btn.clicked.connect(self._toggle_hud_style)
         self._refresh_hud_btn()
+
+        self._hands_btn = _row(QPushButton())
+        self._hands_btn.clicked.connect(self._toggle_hands)
+        self._refresh_hands_btn()
 
         w.adjustSize()
         return w
@@ -6702,6 +6938,52 @@ class JarvisUI:
             self._win.hud.glance(dx, dy, hold)
         except Exception:
             pass
+
+    # Holograms — all thread-safe (tools run in executor threads).
+    def show_hologram(self, model, request_id: int = 0) -> None:
+        self._win._holo_sig.emit(model, int(request_id))
+
+    def refine_hologram(self, model, request_id: int) -> bool:
+        """Swap in a richer design of the same request. False if that
+        hologram is no longer the one on screen."""
+        hv = self._win.hud.holo
+        if hv.model is None or hv.request_id != int(request_id):
+            return False
+        self._win._holo_refine_sig.emit(model, int(request_id))
+        return True
+
+    def holo_command(self, action: str, amount: float = 0.0) -> None:
+        self._win._holo_cmd_sig.emit(str(action), float(amount or 0.0))
+
+    def hologram_active(self) -> bool:
+        return bool(self._win.hud.holo.active)
+
+    def hands_active(self) -> bool:
+        return self._win._hands.running
+
+    def set_hand_control(self, on: bool) -> str:
+        """Switch webcam hand control. From a tool thread it waits until the
+        camera and model are actually up and reports what really happened."""
+        t = self._win._hands
+        if not on:
+            was = t.running
+            t.stop()
+            return ("Hand control off — the webcam is released." if was
+                    else "Hand control was already off.")
+        if t.running:
+            return "Hand control is already on."
+        self._win._cam_stop.set()
+        t.start()
+        if threading.current_thread() is threading.main_thread():
+            return "Hand control starting."     # the Qt thread must not wait
+        if not t.ready.wait(60):
+            return "Hand control is still starting (the first time downloads the hand model)."
+        if t.error:
+            return f"Hand control could not start: {t.error}"
+        return ("Hand control on. The webcam watches the user's hands on this "
+                "computer only. Pinch thumb and index and move to rotate, make a "
+                "fist and move to drag, pinch with both hands and pull apart to "
+                "scale or twist to roll.")
 
     def set_startup_info(self, skills: int, facts: int) -> None:
         """Thread-safe: how many skills were actually loaded and how many

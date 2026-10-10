@@ -63,3 +63,6 @@ screenshots/
 
 # Fallback location for phone uploads when Downloads is not writable
 uploads/
+
+# Models downloaded at first use (the MediaPipe hand model for hand control)
+models/

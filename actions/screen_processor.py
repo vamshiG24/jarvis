@@ -155,18 +155,29 @@ def _capture_camera() -> tuple[bytes, str]:
     if not _CV2:
         raise RuntimeError("OpenCV (cv2) is not installed. Run: pip install opencv-python")
 
-    index   = _get_camera_index()
-    backend = _cv2_backend()
-    cap     = cv2.VideoCapture(index, backend)
+    # While hand control holds the webcam, share its newest frame — opening
+    # the device a second time would fail.
+    try:
+        from core.hands import latest_frame
+        frame = latest_frame()
+    except Exception:
+        frame = None
 
-    if not cap.isOpened():
-        raise RuntimeError(f"Camera index {index} could not be opened.")
+    if frame is not None:
+        ret = True
+    else:
+        index   = _get_camera_index()
+        backend = _cv2_backend()
+        cap     = cv2.VideoCapture(index, backend)
 
-    for _ in range(10):
-        cap.read()
+        if not cap.isOpened():
+            raise RuntimeError(f"Camera index {index} could not be opened.")
 
-    ret, frame = cap.read()
-    cap.release()
+        for _ in range(10):
+            cap.read()
+
+        ret, frame = cap.read()
+        cap.release()
 
     if not ret or frame is None:
         raise RuntimeError("Camera returned no frame.")

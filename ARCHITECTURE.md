@@ -334,6 +334,43 @@ flowchart LR
     PAINT --> B1["cached background"] --> B2["floor grid + sonar (no AA)"] --> B3["projector beam · particles"] --> B4["voice crown"] --> B5["gyroscope rings (depth-bucketed)"] --> B6["arc reactor"] --> B7["gauges · heading tape · boot text"]
 ```
 
+### Holograms
+
+A hologram is a tool answer that lands on the canvas instead of in the log. It
+is drawn by the same canvas over whichever HUD style is active. The scene is
+dimmed (`StarkScene.focus`) while one is up.
+
+```mermaid
+flowchart TB
+    ASK["“show me a water molecule”"] --> LIVE["Gemini Live → holo_show(subject)"]
+    LIVE --> QUICK["_design — STRUCTURED ladder<br/>3.1-flash-lite, JSON mode, SPEC_GUIDE<br/>2–5 s"]
+    QUICK --> SPEC["scene JSON<br/>sphere · box · cylinder · cone · torus · ring<br/>polyline · label · orbit / spin"]
+    SPEC --> BUILD["holo3d.from_spec<br/>parsed + clamped, never executed<br/>→ HoloModel (vertices, edges, orbs, labels)"]
+    FILE["holo_show(file_path) .obj / .stl"] --> MESH["holo3d.from_mesh<br/>welded, feature edges only"] --> MODEL
+    BUILD --> MODEL["HoloModel"]
+    MODEL -->|"JarvisUI.show_hologram → _holo_sig"| VIEW["HudCanvas.holo — HoloView<br/>rotation matrix · offset · scale · request id"]
+    LIVE -.->|"background thread"| RICH["_refine — STRUCTURED_RICH ladder<br/>3.8-flash … 45 s per model"]
+    RICH -->|"refine_hologram(model, id)<br/>same request id and < 100 s, else dropped"| VIEW
+    VIEW --> PAINTH["HoloView.paint<br/>glow · lit orbs back-to-front · depth-bucketed edges<br/>labels (nearest first, no overlaps) · title card"]
+```
+
+Input reaches the same `HoloView` three ways. All of them change only its pose
+on the Qt thread:
+
+```mermaid
+flowchart LR
+    MOUSE["_HoloInput — the transparent centre slot<br/>drag · right-drag · wheel · double-click · close chip"] --> VIEW["HoloView<br/>rotate · move · zoom · roll · reset · close"]
+    VOICE["holo_control tool<br/>rotate_left … zoom_in … spin_on … close"] -->|"_holo_cmd_sig"| VIEW
+    CAM["HandTracker thread (core/hands.py)<br/>webcam → MediaPipe HandLandmarker (VIDEO, 2 hands)"] --> GM["GestureMapper<br/>pinch / fist / two-hand · smoothing<br/>3-frame hold · resting-hand filter"]
+    GM -->|"_hands_sig (hands, ops)"| VIEW
+    GM -->|"cursors"| HUDC["hand cursors on the HUD"]
+```
+
+`HandTracker` owns the webcam only while hand control is on. While it does,
+`hands.latest_frame()` gives the camera snapshot tool and the live camera panel
+its frames, so they don't try to open the device a second time. Frames are
+kept in memory only: one frame at a time, replaced by the next.
+
 ---
 
 ## 7. Module map
@@ -358,6 +395,9 @@ flowchart LR
         UNDO["undo.py"]
         CONF["confirm.py"]
         KF["known_folders.py — real Desktop / Downloads"]
+        H3D["hud3d.py — Stark scene"]
+        HOLO["holo3d.py — hologram models + view"]
+        HANDS["hands.py — webcam gestures"]
         PROMPT["prompt.txt"]
     end
     subgraph MEMPKG["memory/"]
@@ -369,6 +409,7 @@ flowchart LR
         A2["web_search · screen_processor · video_player"]
         A3["computer_settings · computer_control · desktop"]
         A4["reminder · weather_report · send_message · …"]
+        A5["holo_show · holo_control"]
     end
     DASHB["dashboard/server.py"] --> MAINPY
 ```
@@ -382,5 +423,7 @@ flowchart LR
 | `config/api_keys.json` | Gemini key, OS, names, voice, colour, toggles, plugin settings | ❌ ignored |
 | `config/certs/` | Self-signed TLS key and certificate for the phone dashboard | ❌ ignored |
 | `memory/long_term.json` | What the assistant remembers about you, plus session summaries | ❌ ignored |
+| `memory/session_state.json` | The last 24 lines of conversation, for continuing after a crash or restart | ❌ ignored |
+| `models/hand_landmarker.task` | MediaPipe hand model, downloaded the first time hand control is switched on | ❌ ignored |
 | `core/prompt.txt` | System-prompt template; `{tokens}` are filled in at connect | ✅ |
 | `core/face_model.obj` | MediaPipe canonical face (Apache-2.0) | ✅ |

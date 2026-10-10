@@ -17,7 +17,48 @@ reminders and more. There's no subscription; you only need a free Gemini API key
 
 ## 🆕 What's new in this build
 
-This branch adds three things on top of MARK LV: a fix for the Live session crash, a 3D Iron Man-style interface, and a round of correctness fixes.
+On top of MARK LV, this build adds 3D holograms you can turn with your hands, a fix for the Live session crash, a 3D Iron Man-style interface, and a round of correctness fixes.
+
+### 🪐 Holograms — answers you can pick up and turn
+
+Ask for something three-dimensional and it appears above the projection table
+as a hologram: "show me a water molecule", "the inner solar system", "a DNA
+helix", "show the engine.stl on my desktop". Turn it, move it and zoom it with
+the mouse, or with your bare hands through the webcam.
+
+![Two holograms on the Stark HUD: a DNA double helix designed by Gemini, and a real .obj file](docs/images/holograms.png)
+
+| | |
+|---|---|
+| 🧪 **Designed for the question** | Gemini designs the scene as structured data (spheres, rods, rings, cones, labels, orbiting parts), and `core/holo3d.py` builds and draws it. The design is parsed as data and clamped (at most 160 objects and 14,000 edges). It is never executed. |
+| ⚡ **Fast, then rich** | A quick design is on screen in **2–5 s** (`gemini-3.1-flash-lite`). A richer one is designed in the background and swapped in, keeping your angle and zoom: water went from 6 → 23 parts, DNA from 12 → 88 (base pairs, both strands, grooves, a base legend) 34 s later. If the rich design takes more than 100 s, it is dropped instead of surprising you. |
+| 📁 **Your own 3D files** | `.obj` and `.stl` (binary or ASCII) from your folders are drawn as **feature-edge holograms**: only the edges where the surface actually bends, so a 900-triangle head reads as a face, not a mesh. |
+| 🖱️ **Mouse** | Drag to rotate (trackball-style, so it always turns the way your hand moves) · right-drag or Shift-drag to move · scroll to zoom · double-click to reset · **✕ CLOSE HOLOGRAM**. It spins slowly when you let go. |
+| ✋ **Hands** | **CONTROLS → ✋ HAND CONTROL**, or say "let me use my hands". **Pinch** (thumb + index) and move to rotate, make a **fist** and move to drag it around, **pinch with both hands** and pull apart to scale, or twist them to roll. Cursors on the HUD show where it sees your fingertips. A hand resting low in the frame (on the keyboard) is ignored, so typing never drags the hologram. |
+| 🗣️ **Voice** | "Turn it left", "bigger", "spin it", "stop spinning", "reset", "close the hologram" (`holo_control`). |
+| 🎯 **Focus** | While a hologram is up, the gyroscope, crown and reactor fade back so the object is the brightest thing on screen. |
+
+**Hand control is private and opt-in.** It uses Google's MediaPipe hand
+landmarker on your own CPU (Apache-2.0). Frames stay in memory: nothing is
+recorded, saved or sent anywhere. The camera is released the moment you switch
+it off. While it holds the webcam, a "what do you see" snapshot and the camera
+panel share its frames instead of fighting over the device. It needs one
+optional install (see [Requirements](#requirements)); the hand model (7.8 MB)
+downloads the first time you switch it on.
+
+Inspired by [Jared Rhodes'](https://www.youtube.com/@jaredrhod) hand-tracked
+hologram prototypes. Written from scratch here; no code was taken from his
+AGPL project.
+
+**Verified in the running app, not in a test harness.** Real requests through
+the command box designed and showed water (2.0 s), the inner solar system
+(2.5 s) and DNA (4.5 s), with background refinements landing. A real `.obj`
+loaded in under 0.1 s. Mouse drags, wheel zoom, right-drag move and the close
+chip were sent to the live window. Hand control was switched on by asking the
+assistant: the model downloaded, the webcam opened and the tracker reported
+hands, then it was switched off by voice command with the camera released. The gestures are
+tuned by hand and need your hands to judge. If pinch or fist detection feels
+off, the thresholds are at the top of `core/hands.py`.
 
 ### 🛡️ Stable Live sessions — the `1011 Internal error` crash is handled
 
@@ -143,6 +184,8 @@ Nexus sphere renders in about 5 ms per frame, and idle repaint stays at around 2
 | Feature | Description |
 |---|---|
 | 🎙️ Real-time voice | Low-latency conversation in any language via Gemini Live |
+| 🪐 Holograms | 3D answers designed by Gemini, or your own `.obj` / `.stl`, that you rotate, move and zoom |
+| ✋ Hand control | Pinch, fist and two-hand gestures through the webcam, processed on your machine |
 | ✦ Nexus / 🧑 Face / ◉ Core HUD | Three software-rendered centrepieces that react to state and voice |
 | 👄 Real lip-sync | About 50 mouth shapes a second from audio formants and the transcript |
 | 👁️ Visual awareness | Screen capture and webcam vision, labelled by source |
@@ -169,9 +212,9 @@ Nexus sphere renders in about 5 ms per frame, and idle repaint stays at around 2
 ## ⚡ Quick start
 
 ```bash
-git clone https://github.com/FatihMakes/Mark-LV.git
-cd Mark-LV
-git checkout feature/stability-and-ui-overhaul   # this build
+git clone https://github.com/vamshiG24/jarvis.git
+cd jarvis
+git checkout feature/holo-objects   # holograms + hand control, until merged into main
 python setup.py        # installs dependencies for YOUR OS + Playwright browsers
 python main.py
 ```
@@ -193,7 +236,18 @@ pip install -r requirements.txt
 | **Python** | 3.11 – 3.13 |
 | **Hardware** | Microphone and speakers. No GPU needed |
 | **API key** | Free Gemini API key, stored in `config/api_keys.json` |
-| **Optional** | `yt-dlp` for YouTube on the HUD (installed by setup); `openwakeword` for the wake word (one click in ⚙) |
+| **Optional** | `yt-dlp` for YouTube on the HUD (installed by setup); `openwakeword` for the wake word (one click in ⚙); MediaPipe for ✋ hand control (below) |
+
+**Hand control** needs MediaPipe, installed this way:
+
+```bash
+pip install mediapipe --no-deps
+pip install matplotlib absl-py flatbuffers
+```
+
+`--no-deps` matters. MediaPipe's wheel pulls in `opencv-contrib-python`, which
+installs a second copy of `cv2` on top of the app's `opencv-python`, and the
+two break each other. Holograms with the mouse need nothing extra.
 
 ---
 
@@ -233,6 +287,10 @@ These are the advanced keys:
 | `[Gemini] …: ReadError … forcibly closed by the remote host` | The network dropped a request | None. The ladder retries on the next model. If it happens often, check your network or VPN |
 | `FutureWarning: The pynvml package is deprecated` | An old install still has `pynvml` | `pip uninstall -y pynvml` |
 | `API key invalid` and the setup screen reopens | Wrong or revoked key | Paste a valid key |
+| `Hand control could not start: MediaPipe is not installed` | The optional package is missing | The two commands under [Requirements](#requirements) |
+| `Hand control could not start: the webcam … could not be opened` | Another app (Teams, Zoom, the Camera app) has the camera | Close it and switch hand control on again |
+| `[Dashboard] Port 8000 is already in use` | Another program, or a previous JARVIS still closing, holds the port | None for the assistant, which runs normally; only phone remote control is off for that run. Before this build, this silently stopped the whole assistant behind a working window |
+| `[Holo] refinement ready after …s — too late to swap` | The rich hologram design took over 100 s | None. The quick design stays on screen |
 
 ---
 
@@ -248,7 +306,9 @@ Mark-LV/
 ├── actions/             # Bundled skills — each exports a TOOL dict, auto-discovered
 ├── plugins/             # Drop-in skills (_template.py shows the shape)
 ├── core/                # gemini ladder, loaders, echo guard, visemes, avatar, wake word,
-│                        # audio devices, undo, confirm gate, prompt.txt
+│                        # audio devices, undo, confirm gate, prompt.txt,
+│                        # hud3d (Stark scene), holo3d (holograms), hands (gestures)
+├── models/              # downloaded on first use: the hand model (git-ignored)
 ├── memory/              # memory_manager (long_term.json), config_manager (api_keys.json)
 ├── dashboard/           # FastAPI phone remote + static pages
 ├── config/              # api_keys.json + certs/ (both git-ignored)
@@ -270,6 +330,7 @@ Everything stays on your machine. There's no server, telemetry or account.
 | Dashboard TLS key and certificate | `config/certs/` | Self-signed and generated locally |
 | What the assistant remembers | `memory/long_term.json` | Delete it to make the assistant forget everything |
 | The last conversation (for continuing after a crash or restart) | `memory/session_state.json` | Plain text, the last 24 lines. Ignored after 6 h (crash) or 2 h (normal close). Delete it to start fresh |
+| The hand model, if you use hand control | `models/hand_landmarker.task` | Google's MediaPipe model, downloaded once. **Webcam frames are never written anywhere** |
 
 All three are git-ignored (this build fixed the rules that silently didn't
 work). **If you ever pushed `config/api_keys.json` anywhere, revoke the key** at
@@ -284,6 +345,7 @@ stream stops when you mute or close the app.
 ## ⚖️ License & credits
 
 * **Original project:** MARK LV © 2026 **FatihMakes**: [github.com/FatihMakes/Mark-LV](https://github.com/FatihMakes/Mark-LV) · [YouTube @FatihMakes](https://www.youtube.com/@FatihMakes)
-* **This build:** stability fixes, the Nexus UI, the architecture docs and the changes listed above, by **Gowni Vamshi**
+* **This build:** holograms and hand control, stability fixes, the Stark and Nexus UIs, the architecture docs and the changes listed above, by **Gowni Vamshi**
 * **License:** [Creative Commons BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/) (see [LICENSE](LICENSE)). Personal and non-commercial use only. Keep this attribution when you share it.
 * **Third-party asset:** `core/face_model.obj`, the MediaPipe canonical face model (Apache-2.0)
+* **Hand tracking:** [MediaPipe](https://github.com/google-ai-edge/mediapipe) HandLandmarker (Apache-2.0), an optional install; the model is downloaded at first use, not shipped

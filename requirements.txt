@@ -101,7 +101,11 @@ nvidia-ml-py                 # system_monitor + the HUD's GPU meter (NVIDIA).
 #   pip install pandas       # file_processor: spreadsheet/CSV analysis
 #   pip install pydub        # file_processor: audio metadata and conversion
 #                            #   (also needs ffmpeg on PATH for most formats)
-#   pip install mediapipe    # pushup_counter: elbow-angle rep detection
+#   pip install mediapipe --no-deps && pip install matplotlib absl-py flatbuffers
+#                            # ✋ hand control for holograms (core/hands.py).
+#                            #   --no-deps: mediapipe's wheel would otherwise add
+#                            #   opencv-contrib-python on top of opencv-python —
+#                            #   two packages fighting over one `cv2`.
 
 # ── Optional: local wake word ("Hey Jarvis") ──────────────────────────────────
 # Deliberately NOT installed by default — it's opt-in. Enable it (and download

@@ -106,6 +106,9 @@ class StarkScene:
         self.pulses: list[float] = []
         self._last_pulse = 0.0
         self.speed = 1.0
+        # 0..1 — how far the table steps back for a hologram (set by the canvas)
+        self.focus_target = 0.0
+        self.focus = 0.0
         # Real startup facts, fed by the canvas every frame (see HudCanvas).
         self.boot_info: dict = {"online_at": 0.0, "link": "CONNECTING",
                                 "detail": "", "skills": 0}
@@ -165,6 +168,7 @@ class StarkScene:
         self.speed += (target - self.speed) * min(1.0, dt * 2.5)
         self.t += dt * self.speed
         self.amp = amp
+        self.focus += (self.focus_target - self.focus) * min(1.0, dt * 4.0)
 
         for ring in self.rings:
             ring.spin += ring.spin_speed * dt * self.speed
@@ -376,7 +380,7 @@ class StarkScene:
         dep = np.clip((az - (self.D - r0)) / (2 * r0), 0, 1)
         crown_col = white if speaking else (gold if thinking else pri)
         self._draw_segments(p, ax, ay, bx2, by2, dep, crown_col,
-                            0.30 + 0.45 * min(1.0, amp * 2), 1.5)
+                            (0.30 + 0.45 * min(1.0, amp * 2)) * (1.0 - 0.6 * self.focus), 1.5)
 
         # ── the gyroscope ────────────────────────────────────────────────
         head = (self.t * (160.0 if thinking else 40.0)) % 360.0
@@ -399,7 +403,7 @@ class StarkScene:
             on &= np.arange(len(deg)) < int(len(deg) * reveal)
             on &= (zc[:-1] > 0.4) & (zc[1:] > 0.4)
             col = roles.get(ring.role, pri)
-            alpha = 0.95 if ring.role != "dim" else 0.55
+            alpha = (0.95 if ring.role != "dim" else 0.55) * (1.0 - 0.78 * self.focus)
             self._draw_segments(p, sx[:-1], sy[:-1], sx[1:], sy[1:], dep, col,
                                 alpha * (0.6 + 0.4 * reveal), ring.width,
                                 on=on, glow=ring.glow)
@@ -436,7 +440,7 @@ class StarkScene:
         ox, oy, oz = self._proj(np.zeros((1, 3), dtype=np.float32))
         ox, oy = float(ox[0]), float(oy[0])
         rr = self.f * 0.30 / float(oz[0]) * (0.4 + 0.6 * eb) * (1.0 + 0.10 * amp)
-        self._reactor(p, ox, oy, rr, pal, amp, eb)
+        self._reactor(p, ox, oy, rr, pal, amp, eb * (1.0 - 0.88 * self.focus))
 
         # ── screen-space HUD ─────────────────────────────────────────────
         self._gauges(p, ox, oy, unit, pal, telemetry, eb, core)
