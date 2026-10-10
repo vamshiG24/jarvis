@@ -19,8 +19,8 @@ reading in a terminal.
                 │                                                                  │             │
   🔊 Speakers ◀─│  RawOutputStream ◀── audio_in_queue ◀──┐                         ▼             │       ┌────────────────────┐
                 │        │ visemes / level               │                ┌─────────────────┐    │  WSS  │  Gemini Live API   │
-                │        ▼                               └────────────────│   JarvisLive    │◀───┼──────▶│  gemini-3.1-flash- │
-                │  ┌───────────────┐   Qt signals    ┌────────────┐       │  (main.py,      │    │       │  live-preview      │
+                │        ▼                               └────────────────│   JarvisLive    │◀───┼──────▶│  gemini-3.8-live   │
+                │  ┌───────────────┐   Qt signals    ┌────────────┐       │  (main.py,      │    │       │  (stable)          │
                 │  │  PyQt6 HUD    │◀───────────────▶│ JarvisUI   │◀─────▶│   asyncio loop) │    │       └────────────────────┘
                 │  │  (ui.py)      │                 │  facade    │       └───────┬─────────┘    │       ┌────────────────────┐
                 │  │ Nexus · Face  │                 └────────────┘               │ tool calls   │ HTTPS │ Gemini REST models │
@@ -244,15 +244,23 @@ rejected resumption handle, and quota errors raised mid-session were never
 recognised. `_leaf_errors()`, `_close_code()` and `_error_text()` in `main.py`
 always look inside the group.
 
-**Model-aware config.** `_is_gen3_live()` keeps settings that
-`gemini-3.1-flash-live` doesn't support out of the config:
+**Model-aware config.** `_live_caps(model)` returns what each Live
+generation accepts, because the generations disagree, sometimes in opposite
+directions. The live ladder is `gemini-3.8-live` → `gemini-3.1-flash-live-preview`
+→ `gemini-2.5-flash-native-audio`, and `live_model` in the config can put another
+model, such as `gemini-3.8-live-extended-thinking`, in front.
 
-| Setting | 2.5 native-audio | 3.x Live |
-|---|---|---|
-| Proactive audio (`v1alpha`) | ✅ on | ❌ omitted, `v1beta` used |
-| Context-window compression | ✅ on | ❌ off by default (the identified 1011 trigger) |
-| Thinking | `thinking_budget` | `thinking_level` |
-| Tool `behavior` / `scheduling` | sent | stripped (sync calls only) |
+| Setting | 2.5 native-audio | 3.1 flash live | 3.8 live *(default)* |
+|---|---|---|---|
+| Proactive audio | ✅ configurable (`v1alpha`) | ❌ not supported | always on, and setting the field is an **error**, so it's never sent |
+| Context-window compression | ✅ on | ❌ off by default (the identified 1011 trigger) | off by default (`auto`) |
+| Thinking | `thinking_budget` | `thinking_level` | **no `thinking_config` allowed** (interleaved reasoning is built in) |
+| Tool calls | `behavior` as declared | sync only, so `behavior`/`scheduling` are stripped | **async by default**, so every tool is declared `BLOCKING` (a tool that asks for `NON_BLOCKING` keeps it and gets `scheduling`) |
+
+**3.8 resume quirk.** Right after a connection closes, 3.8 refuses a resume with
+a 1011 for about 1.5 s (gemini-live-api-examples #60). Deliberate reconnects
+therefore wait 2 s before resuming, and a resume refused at once is retried a
+single time before falling back to a fresh session with the transcript.
 
 ---
 

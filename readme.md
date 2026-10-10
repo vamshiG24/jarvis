@@ -41,6 +41,28 @@ Also added:
 * **Calm logging.** One line per dropped connection instead of a 60-line traceback. Set `JARVIS_DEBUG=1` to get full tracebacks back.
 * **A live link indicator** in the header and HUD: `ONLINE` / `CONNECTING` / `RECOVERING` / `OFFLINE`.
 
+### 🧠 Upgraded to the newest Gemini models
+
+Picked from the models **this API key actually offers** (`models.list`) and
+ordered by **measured** speed, not by version number:
+
+| Job | Model | Why |
+|---|---|---|
+| Voice conversation | **`gemini-3.8-live`** (stable) | Newest Live model. Measured first audio in 1.2–1.6 s with a tool call, against 1.4–6.9 s on 3.1. |
+| Backup voices | `gemini-3.1-flash-live-preview` → `gemini-2.5-flash-native-audio` | Used automatically on quota or outage. |
+| Reasoning, code, summaries | **`gemini-3.8-flash`** leads | Newest text model. |
+| Quick replies, JSON | `gemini-3.1-flash-lite` leads | Fastest clean JSON (about 1 s). |
+| Scanned PDFs | `gemini-2.5-flash-lite` → `gemini-3.1-flash-lite` | 9–12 s. 3.8-flash took 75 s, too slow inside a voice turn. |
+| Web search with sources | `gemini-2.5-flash` | 3.8-flash has no search quota on the free tier (429). It stays in the chain for paid keys. |
+
+3.8-live needed real changes:
+- Every tool is declared `BLOCKING`, because 3.8 defaults to async calls.
+- `thinking_config` is never sent; 3.8 rejects it.
+- Proactive audio is left to the model; 3.8 has it always on and rejects the setting.
+- 3.8 sometimes refuses a resume for about 1.5 s after a reconnect, so the app waits 2 s and retries once before falling back to a fresh session.
+
+Verified end to end on 3.8 with real speech: resume, fresh session and 1011 recovery all answered correctly.
+
 ### 🦾 The Stark UI — a 3D J.A.R.V.I.S. interface
 
 The whole window is now a holographic projection table in the style of the Iron
@@ -170,7 +192,8 @@ These are the advanced keys:
 |---|---|---|
 | `hud_style` | `"stark"` | `stark`, `nexus`, `face` or `core`. Cycle with 🎛 → HUD |
 | `context_compression` | `"auto"` | `auto` = off on Gemini 3.x Live (avoids 1011s), on for 2.5. Use `true` or `false` to force it |
-| `thinking_enabled` | `false` | Lets the Live model reason before answering (uses `thinking_level` on 3.x) |
+| `live_model` | *(unset)* | Put a specific Live model first, e.g. `gemini-3.8-live-extended-thinking` for deeper reasoning (slower first word) |
+| `thinking_enabled` | `false` | Lets 2.5 / 3.1 Live models reason before answering. 3.8 reasons on its own and ignores this. |
 | `proactive_audio` | `true` | 2.5 native-audio only. Ignored on 3.x, which doesn't support it |
 | `turn_tuning` | off | `{"enabled": true, "silence_ms": 550, ...}` sets how quickly your turn ends |
 | `media_resolution` | `"medium"` | Token resolution for screenshots and camera frames |
