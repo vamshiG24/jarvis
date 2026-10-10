@@ -106,6 +106,9 @@ class StarkScene:
         self.pulses: list[float] = []
         self._last_pulse = 0.0
         self.speed = 1.0
+        # Real startup facts, fed by the canvas every frame (see HudCanvas).
+        self.boot_info: dict = {"online_at": 0.0, "link": "CONNECTING",
+                                "detail": "", "skills": 0}
 
         # The gyroscope. Radii, tilts and patterns are chosen so no two rings
         # share a plane — that is what makes it read as a 3D object rather
@@ -190,8 +193,13 @@ class StarkScene:
         return min(1.0, (time.time() - self.boot_t0) / 3.2)
 
     def booting(self) -> bool:
-        """True while the boot sequence (and its 'online' fade) is on screen."""
-        return time.time() - self.boot_t0 < 4.6
+        """True until the link has really come up (plus a short fade).
+
+        Driven by the actual startup — not a timer. It used to finish after
+        3.2 seconds and announce "ALL SYSTEMS ONLINE" whether or not the
+        assistant had connected to anything."""
+        oa = float(self.boot_info.get("online_at") or 0.0)
+        return oa == 0.0 or time.time() - oa < 1.8
 
     # ── projection ──────────────────────────────────────────────────────────
 
@@ -558,29 +566,48 @@ class StarkScene:
         p.setBrush(Qt.BrushStyle.NoBrush)
 
     def _boot_text(self, p, ox, y, unit, pal, boot, name):
-        since = time.time() - self.boot_t0
+        """The startup screen, reporting what has ACTUALLY happened: the
+        interface is up (we are drawing it), the skills the registries really
+        loaded, and the real state of the link to the model. The bar is the
+        share of those stages that are done — not a timer."""
         pri, white = pal["pri"], pal["white"]
-        if boot < 1.0:
-            txt = f"INITIALISING  {name}"
-            sub = f"{int(boot * 100):3d}%   CORE · NEURAL NET · VOICE LINK"
-            a = 1.0
-        else:
+        info = self.boot_info
+        link = str(info.get("link") or "CONNECTING").upper()
+        model = str(info.get("detail") or "")
+        skills = int(info.get("skills") or 0)
+        online_at = float(info.get("online_at") or 0.0)
+
+        stages_done = 1 + (1 if skills else 0) + (1 if online_at else 0)
+        progress = stages_done / 3.0
+        col = white
+        if online_at:
             txt = "ALL SYSTEMS ONLINE"
-            sub = f"{name}  ·  AT YOUR SERVICE"
-            a = max(0.0, 1.0 - (since - 3.2) / 1.4)
+            sub = f"{name}  ·  {model or 'LIVE'}  ·  {skills} SKILLS"
+            a = max(0.0, 1.0 - (time.time() - online_at) / 1.8)
+        else:
+            a = 1.0
+            if link == "OFFLINE":
+                txt, col = "LINK DOWN  —  RETRYING", pal["red"]
+            elif link == "RECOVERING":
+                txt, col = "RE-ESTABLISHING LINK", pal["gold"]
+            else:
+                txt = f"INITIALISING  {name}"
+            link_part = f"LINK {link.lower()}" + (f" {model}" if model else "")
+            sub = (f"INTERFACE ✓    SKILLS {('✓ ' + str(skills)) if skills else '…'}    "
+                   f"{link_part}…")
         f = QFont("Bahnschrift", max(10, int(unit * 0.085)), QFont.Weight.Bold)
         f.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 4)
         p.setFont(f)
-        p.setPen(QPen(_qc(white, a)))
+        p.setPen(QPen(_qc(col, a)))
         p.drawText(QRectF(ox - 300, y, 600, 30), Qt.AlignmentFlag.AlignCenter, txt)
         p.setFont(QFont("Consolas", max(7, int(unit * 0.05))))
         p.setPen(QPen(_qc(pri, a * 0.85)))
         p.drawText(QRectF(ox - 300, y + 28, 600, 18), Qt.AlignmentFlag.AlignCenter, sub)
-        if boot < 1.0:
+        if not online_at:
             bw = unit * 2.2
             p.setPen(QPen(_qc(pri, 0.4), 1))
             p.drawRect(QRectF(ox - bw / 2, y + 52, bw, 4))
-            p.fillRect(QRectF(ox - bw / 2, y + 52, bw * boot, 4), _qc(pri, 0.9))
+            p.fillRect(QRectF(ox - bw / 2, y + 52, bw * progress, 4), _qc(pri, 0.9))
 
 
 def live_swell(speaking: bool, amp: float) -> bool:

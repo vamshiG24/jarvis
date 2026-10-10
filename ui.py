@@ -559,6 +559,8 @@ class HudCanvas(QWidget):
         self.link_state  = "CONNECTING"
         self.link_detail = ""
         self.session_t0  = 0.0
+        self.skills_loaded = 0        # set from main once the registries are built
+        self.online_at   = 0.0        # when the link first came up — ends the boot screen
 
         # ── Stark (3D) state ─────────────────────────────────────────────────
         # The canvas now sits behind the WHOLE window, so every style draws
@@ -1404,6 +1406,11 @@ class HudCanvas(QWidget):
         if self.hud_style == "stark" and self._stark is not None:
             try:
                 snap = _metrics.snapshot()
+                # The boot screen reports real progress: these are the actual
+                # startup facts, not a timer.
+                self._stark.boot_info = {
+                    "online_at": self.online_at, "link": self.link_state,
+                    "detail": self.link_detail, "skills": self.skills_loaded}
                 self._stark.paint(p, full, area, self._stark_palette(),
                                   _title_text(self._assistant_name or "JARVIS"), snap)
             except Exception as e:                     # never kill the HUD
@@ -3783,6 +3790,7 @@ class MainWindow(QMainWindow):
     _quiz_hide_sig  = pyqtSignal()
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
     _link_sig       = pyqtSignal(str, str)   # (state, detail) — live link indicator
+    _startup_sig    = pyqtSignal(int, int)   # (skills loaded, memory facts)
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -4083,6 +4091,7 @@ class MainWindow(QMainWindow):
         self._quiz_hide_sig.connect(self._hide_quiz)
         self._review_sig.connect(self._show_review)
         self._link_sig.connect(self._on_link_status)
+        self._startup_sig.connect(self._on_startup_info)
         self._cam_stop = threading.Event()
 
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
@@ -4661,6 +4670,19 @@ class MainWindow(QMainWindow):
     def _update_metrics(self):
         snap = _metrics.snapshot()
 
+        # Facts stored in memory change as you talk; recount every ~30 s so
+        # the chip stays true without reading the file every two seconds.
+        self._facts_tick = (getattr(self, "_facts_tick", 0) + 1) % 15
+        if self._facts_tick == 0 and self._skills_count:
+            try:
+                from memory.memory_manager import all_entries_for_ui
+                n = len(all_entries_for_ui())
+                if n != self._facts_count:
+                    self._facts_count = n
+                    self._refresh_skill_chip()
+            except Exception:
+                pass
+
         # CPU
         cpu = snap["cpu"]
         self._bar_cpu.set_value(cpu, f"{cpu:.0f}%")
@@ -4866,14 +4888,20 @@ class MainWindow(QMainWindow):
             }}""")
 
     def _on_link_status(self, state: str, detail: str) -> None:
-        """Slot (Qt thread): header chip + HUD telemetry."""
+        """Slot (Qt thread): header chip, side-panel chips and HUD telemetry."""
         self._apply_link_chip(state, detail)
         st = (state or "").upper()
         self.hud.link_state = st
         self.hud.link_detail = detail
+        col = getattr(C, self._LINK_CHIP.get(st, "PRI"), C.PRI)
+        self._set_chip(self._chip_link, f"LINK  ·  {st or '—'}", col)
+        if detail and st in ("ONLINE", "CONNECTING"):
+            self._set_chip(self._chip_model, detail.upper(), C.PRI if st == "ONLINE" else C.TEXT_DIM)
         if st == "ONLINE":
             if not self.hud.session_t0:
                 self.hud.session_t0 = time.time()
+            if not self.hud.online_at:
+                self.hud.online_at = time.time()     # ends the boot screen
         elif st == "OFFLINE":
             self.hud.session_t0 = 0.0
 
@@ -4931,21 +4959,45 @@ class MainWindow(QMainWindow):
 
         lay.addStretch()
 
-        for txt, col in [
-            ("AI CORE  ·  ACTIVE",            C.GREEN),
-            ("VOICE  ·  GEMINI LIVE",         C.PRI),
-            ("PROTOCOL  ·  " + APP_PROTOCOL,  C.TEXT_DIM),
-        ]:
-            lbl = QLabel(txt)
+        # Live status chips — every one of them is read from the running
+        # system (link events, the model actually in use, the skills actually
+        # discovered, the facts actually stored). They replaced fixed labels
+        # that said "AI CORE · ACTIVE" even while the link was down.
+        def _chip() -> QLabel:
+            lbl = QLabel("…")
             lbl.setFont(_mono(7, QFont.Weight.Bold))
             lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet(
-                f"color: {col}; background: {C.PANEL2};"
-                f"border: 1px solid {C.BORDER_A}; border-radius: 9px; padding: 4px 6px;"
-            )
             lay.addWidget(lbl)
+            return lbl
+        self._chip_link = _chip()
+        self._chip_model = _chip()
+        self._chip_skills = _chip()
+        self._skills_count = 0
+        self._facts_count = -1
+        self._set_chip(self._chip_link, "LINK  ·  STARTING", C.ACC2)
+        self._set_chip(self._chip_model, "MODEL  ·  —", C.TEXT_DIM)
+        self._set_chip(self._chip_skills, "SKILLS  ·  LOADING", C.TEXT_DIM)
 
         return w
+
+    @staticmethod
+    def _set_chip(lbl: QLabel, text: str, col: str) -> None:
+        lbl.setText(text)
+        lbl.setStyleSheet(
+            f"color: {col}; background: {C.PANEL2};"
+            f"border: 1px solid {C.BORDER_A}; border-radius: 9px; padding: 4px 6px;")
+
+    def _refresh_skill_chip(self) -> None:
+        facts = f"  ·  {self._facts_count} FACTS" if self._facts_count >= 0 else ""
+        if self._skills_count:
+            self._set_chip(self._chip_skills, f"{self._skills_count} SKILLS{facts}", C.PRI)
+
+    def _on_startup_info(self, tools: int, facts: int) -> None:
+        """Slot: what the assistant actually loaded at startup."""
+        self._skills_count = int(tools)
+        self._facts_count = int(facts)
+        self.hud.skills_loaded = int(tools)
+        self._refresh_skill_chip()
     def _build_right_panel(self) -> QWidget:
         w = HoloPanel("COMMS  //  CONTROL")
         w.setFixedWidth(_RIGHT_W)
@@ -6650,6 +6702,11 @@ class JarvisUI:
             self._win.hud.glance(dx, dy, hold)
         except Exception:
             pass
+
+    def set_startup_info(self, skills: int, facts: int) -> None:
+        """Thread-safe: how many skills were actually loaded and how many
+        facts are actually stored — shown on the boot screen and the chips."""
+        self._win._startup_sig.emit(int(skills), int(facts))
 
     def set_link_status(self, state: str, detail: str = "") -> None:
         """Thread-safe: show the live connection state — ONLINE, CONNECTING,

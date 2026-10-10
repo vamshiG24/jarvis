@@ -793,6 +793,21 @@ class JarvisLive:
         self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # ⚙ settings tab
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
 
+        # What actually loaded — the boot screen and the side-panel chips show
+        # these numbers, not a script.
+        try:
+            from memory.memory_manager import all_entries_for_ui
+            _facts = len(all_entries_for_ui())
+        except Exception:
+            _facts = 0
+        _skills = (len(TOOL_DECLARATIONS)
+                   + len(self._action_registry.get_tool_declarations())
+                   + len(self._plugin_registry.get_tool_declarations()))
+        try:
+            self.ui.set_startup_info(_skills, _facts)
+        except Exception:
+            pass
+
         # ── Wake word ────────────────────────────────────────────────────────
         # _awake gates the mic (see _listen_audio) and the background speakers.
         # It is True whenever wake word is OFF, so default behaviour is unchanged.
@@ -2732,7 +2747,6 @@ class JarvisLive:
             try:
                 print("[JARVIS] Connecting...")
                 self.ui.set_state("THINKING")
-                self._link("CONNECTING")
                 # Pick the rung to open the conversation on. A model resting
                 # off a quota limit is skipped; the name is published back to
                 # LIVE_MODEL so plugins follow whatever is actually in use.
@@ -2740,6 +2754,7 @@ class JarvisLive:
                 LIVE_MODEL = _gemini.live_model()
                 live_model = LIVE_MODEL
                 print(f"[JARVIS] Live model: {live_model}")
+                self._link("CONNECTING", live_model.split("/")[-1])
 
                 # A handle only resumes on the model that issued it. After a
                 # quota fail-over (or a restart onto a different model) the

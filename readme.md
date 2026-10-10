@@ -91,8 +91,8 @@ the panels float over it as holographic glass.
 | 🎚️ **Voice crown** | An equalizer standing up around the core, driven by the real audio. |
 | 🎯 **Helmet HUD overlays** | CPU and memory arc gauges flanking the core, a heading tape across the top, and corner read-outs (neural link, session timer, voice level, core state). |
 | 🎨 **State is colour** | Cyan when listening, white-hot when speaking, gold when thinking, amber when recovering, red when muted. |
-| 🚀 **Boot sequence** | "INITIALISING J.A.R.V.I.S." with the rings drawing themselves in, then "ALL SYSTEMS ONLINE". |
-| 🪟 **Floating glass panels** | Chamfered corners, glowing edges and title tabs: **System Diagnostics** (now with disk and battery) and **Comms // Control**. |
+| 🚀 **Boot sequence** | Shows the **real** startup stages: interface ✓, skills ✓ (the actual count loaded), then the link to the actual model. It says "ALL SYSTEMS ONLINE" only once Gemini has really connected, and "LINK DOWN — RETRYING" if it hasn't. Nothing on it is a timer. |
+| 🪟 **Floating glass panels** | Chamfered corners, glowing edges and title tabs: **System Diagnostics** (now with disk and battery) and **Comms // Control**. The status chips are live: link state, the model actually in use, and the number of skills loaded and facts in memory. |
 | 🖥️ **Frameless window** | The header is the title bar: drag to move (with Windows snapping), double-click to maximise, and window controls top-right. Resize from the bottom-right grip; F11 for fullscreen. |
 
 **Performance:** about 10–12 ms per frame on a laptop CPU, the same as the original animated face. The rate drops to about 10 fps when the window isn't focused, unless the assistant is speaking. The panels are opaque on purpose, so Qt never repaints them along with the scene.
