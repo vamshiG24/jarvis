@@ -2,8 +2,8 @@
 holo_show — answer with a 3D hologram.
 
 "Show me a water molecule", "the solar system", "a DNA helix", "show the
-engine.stl on my desktop": the object appears as a hologram above the
-projection table, and the user turns it with the mouse or their hands.
+engine.stl on my desktop": the object opens as a hologram in its own window
+(never over the HUD), and the user turns it with the mouse or their hands.
 
 Two sources, both real:
   * a subject — Gemini DESIGNS the scene as structured JSON (core/holo3d.py
@@ -99,7 +99,7 @@ def holo_show(parameters: dict, player=None) -> str:
     how = ("drag to rotate, right-drag to move, scroll to zoom"
            + (", or pinch and move with their hands" if hands else
               " (hand control can be switched on with holo_control action='hands_on')"))
-    return (f"Hologram on screen: {model.title}. {model.caption} "
+    return (f"Hologram open in its own window: {model.title}. {model.caption} "
             f"({model.size_text}). The user can {how}. "
             f"Tell them in one or two sentences what they are looking at — the "
             f"interesting parts, not coordinates.")

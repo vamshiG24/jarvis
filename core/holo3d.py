@@ -514,19 +514,21 @@ class HoloView:
             self.model = None
             self.closing_at = 0.0
 
-    # The title block above and the HUD's status band below are kept clear;
-    # the object lives in the stage between them.
+    # The title block above and the band below (hint line, projector) are
+    # kept clear; the object lives in the stage between them. A host can set
+    # these per instance.
     TITLE_BAND = 96
     STATUS_BAND = 124
+    CAPTION_MARGIN = 350
 
     def stage(self, rect: QRectF) -> QRectF:
         return QRectF(rect.left(), rect.top() + self.TITLE_BAND, rect.width(),
                       max(120.0, rect.height() - self.TITLE_BAND - self.STATUS_BAND))
 
     def caption_width(self, rect: QRectF) -> float:
-        """The centre column for the caption — clear of the corner readouts
-        and the close chip."""
-        return max(220.0, min(560.0, rect.width() - 350.0))
+        """The centre column for the caption — clear of whatever the host
+        draws in the corners."""
+        return max(220.0, min(560.0, rect.width() - self.CAPTION_MARGIN))
 
     def hit(self, x: float, y: float, rect: QRectF) -> bool:
         """Is screen point (x, y) on the hologram (roughly)?"""
@@ -609,7 +611,10 @@ class HoloView:
             lf = QFont("Bahnschrift", 9, QFont.Weight.DemiBold)
             lm = QFontMetricsF(lf)
             p.setFont(lf)
-            placed: list[QRectF] = []
+            # The title card is drawn last but its place is reserved first, so
+            # a label on a zoomed-in object never covers it.
+            tw = self.caption_width(rect) + 120
+            placed: list[QRectF] = [QRectF(rect.center().x() - tw / 2, rect.top() + 36, tw, 60)]
             for vi, text, ci in sorted(m.labels, key=lambda l: zc[l[0]]):
                 if zc[vi] <= 0.3:
                     continue

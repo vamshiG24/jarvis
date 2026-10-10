@@ -302,8 +302,10 @@ flowchart TB
         end
     end
     OVER["Floating overlays<br/>Setup · Customise · Audio devices · Memory · Plugins<br/>Remote QR · Confirm banner · Clipboard · Camera preview"]
+    HOLOWIN["HoloWindow — a separate top-level window<br/>holograms · hand cursors (see Holograms below)"]
     CANVAS -.->|centres scene on| STACK
     WIN --- OVER
+    WIN -.->|opens on demand| HOLOWIN
 ```
 
 **Why the panels are opaque.** The scene repaints 20–30 times a second. Qt
@@ -336,9 +338,13 @@ flowchart LR
 
 ### Holograms
 
-A hologram is a tool answer that lands on the canvas instead of in the log. It
-is drawn by the same canvas over whichever HUD style is active. The scene is
-dimmed (`StarkScene.focus`) while one is up.
+A hologram is a tool answer that opens in a window of its own, `HoloWindow`,
+instead of in the log. The HUD is never drawn over. `HoloWindow` is a
+frameless top-level window with its own taskbar entry, so it can sit on a
+second monitor or be switched to like a tab. It has no parent, which keeps it
+from being pinned above JARVIS, and it has `WA_QuitOnClose` off, so closing
+JARVIS still quits the app. Its geometry is saved to `holo_window` in the
+config.
 
 ```mermaid
 flowchart TB
@@ -348,22 +354,24 @@ flowchart TB
     SPEC --> BUILD["holo3d.from_spec<br/>parsed + clamped, never executed<br/>→ HoloModel (vertices, edges, orbs, labels)"]
     FILE["holo_show(file_path) .obj / .stl"] --> MESH["holo3d.from_mesh<br/>welded, feature edges only"] --> MODEL
     BUILD --> MODEL["HoloModel"]
-    MODEL -->|"JarvisUI.show_hologram → _holo_sig"| VIEW["HudCanvas.holo — HoloView<br/>rotation matrix · offset · scale · request id"]
+    MODEL -->|"JarvisUI.show_hologram → _holo_sig"| WIN["HoloWindow.show_model<br/>place (saved spot · other monitor · centre) · raise"]
+    WIN --> VIEW["_HoloCanvas.view — HoloView<br/>rotation matrix · offset · scale · request id"]
     LIVE -.->|"background thread"| RICH["_refine — STRUCTURED_RICH ladder<br/>3.8-flash … 45 s per model"]
     RICH -->|"refine_hologram(model, id)<br/>same request id and < 100 s, else dropped"| VIEW
-    VIEW --> PAINTH["HoloView.paint<br/>glow · lit orbs back-to-front · depth-bucketed edges<br/>labels (nearest first, no overlaps) · title card"]
+    VIEW --> PAINTH["_HoloCanvas.paintEvent<br/>cached backdrop: floor grid · projector · beam<br/>HoloView.paint: glow · lit orbs back-to-front · depth-bucketed edges<br/>labels (nearest first, clear of each other and the title) · title card<br/>hint line · hand cursors"]
 ```
 
 Input reaches the same `HoloView` three ways. All of them change only its pose
-on the Qt thread:
+on the Qt thread. A 30 Hz timer in the window steps the spin, and hides the
+window once a voice "close" has faded the model out.
 
 ```mermaid
 flowchart LR
-    MOUSE["_HoloInput — the transparent centre slot<br/>drag · right-drag · wheel · double-click · close chip"] --> VIEW["HoloView<br/>rotate · move · zoom · roll · reset · close"]
+    MOUSE["_HoloCanvas — mouse and keys<br/>drag · right-drag · wheel · double-click<br/>R · + / − · arrows · Space · Esc (window shortcut)"] --> VIEW["HoloView<br/>rotate · move · zoom · roll · reset · close"]
     VOICE["holo_control tool<br/>rotate_left … zoom_in … spin_on … close"] -->|"_holo_cmd_sig"| VIEW
     CAM["HandTracker thread (core/hands.py)<br/>webcam → MediaPipe HandLandmarker (VIDEO, 2 hands)"] --> GM["GestureMapper<br/>pinch / fist / two-hand · smoothing<br/>3-frame hold · resting-hand filter"]
     GM -->|"_hands_sig (hands, ops)"| VIEW
-    GM -->|"cursors"| HUDC["hand cursors on the HUD"]
+    GM -->|"cursors"| HUDC["hand cursors in the hologram window"]
 ```
 
 `HandTracker` owns the webcam only while hand control is on. While it does,
