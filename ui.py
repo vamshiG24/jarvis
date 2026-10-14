@@ -58,6 +58,7 @@ except Exception as _e:            # noqa: BLE001 - reported, never fatal
 
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QListWidget, QListWidgetItem,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
     QGraphicsScene, QGraphicsView,
     QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
@@ -2021,6 +2022,477 @@ class HoloWindow(QWidget):
             self._save_tmr.start(800)
 
 
+class AgentWindow(QWidget):
+    """The background agent's tasks, in a window of their own — like the
+    hologram window, so nothing is drawn over the HUD. For each task: the goal,
+    its plan, every step as it happens, what it is waiting on, and the result.
+    Answer, cancel and resume here as well as by voice.
+
+    Everything shown comes from core/agent.py's live snapshot; nothing here
+    is decided by the window itself."""
+
+    TITLE = "J.A.R.V.I.S. — TASKS"
+
+    def __init__(self, anchor: QWidget | None = None):
+        super().__init__(None, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_QuitOnClose, False)
+        self.setWindowTitle(self.TITLE)
+        if anchor is not None:
+            self.setWindowIcon(anchor.windowIcon())
+        self.setMinimumSize(620, 460)
+        self.setStyleSheet(f"AgentWindow {{ background: {C.BG}; }}")
+        self.setAutoFillBackground(True)
+        pal = self.palette()
+        pal.setColor(self.backgroundRole(), qcol(C.BG))
+        self.setPalette(pal)
+        self._anchor = anchor
+        self._placed = False
+        self._tasks: list[dict] = []
+        self._sel = ""                       # selected task id
+        self._log_key: tuple = ()            # (task id, first entry time, entries shown)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        bar = _DragBar(self)
+        bar.setFixedHeight(44)
+        bl = QHBoxLayout(bar)
+        bl.setContentsMargins(14, 0, 10, 0)
+        bl.setSpacing(6)
+        self._title = QLabel("◆  AGENT  //  TASKS")
+        self._title.setFont(_display(10, QFont.Weight.Bold))
+        self._title.setStyleSheet(f"color: {C.PRI}; background: transparent; letter-spacing: 2px;")
+        bl.addWidget(self._title, 1)
+        mn = _window_button("—", "Minimise")
+        mn.clicked.connect(self.showMinimized)
+        mx = _window_button("☐", "Maximise / restore")
+        mx.clicked.connect(lambda: self.showNormal() if self.isMaximized() else self.showMaximized())
+        cl = _window_button("✕", "Close — tasks keep running", danger=True)
+        cl.clicked.connect(self.close)
+        for b in (mn, mx, cl):
+            b.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            bl.addWidget(b)
+        lay.addWidget(bar)
+        QShortcut(QKeySequence(Qt.Key.Key_Escape), self, activated=self.close)
+
+        body = QHBoxLayout()
+        body.setContentsMargins(12, 10, 12, 12)
+        body.setSpacing(12)
+        lay.addLayout(body, 1)
+
+        self._list = QListWidget()
+        self._list.setFixedWidth(240)
+        self._list.setFont(_mono(8))
+        self._list.setWordWrap(True)
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._list.setStyleSheet(f"""
+            QListWidget {{ background: {C.DARK}; color: {C.TEXT};
+                           border: 1px solid {C.BORDER}; border-radius: 8px; padding: 4px; outline: 0; }}
+            QListWidget::item {{ padding: 7px 6px; border-bottom: 1px solid {C.BORDER}; }}
+            QListWidget::item:selected {{ background: {C.PRI_GHO}; color: {C.WHITE};
+                                          border-left: 2px solid {C.PRI}; }}
+            {self._scroll_qss()}""")
+        self._list.currentItemChanged.connect(self._on_pick)
+        body.addWidget(self._list)
+
+        right = QVBoxLayout()
+        right.setSpacing(6)
+        body.addLayout(right, 1)
+
+        self._goal = QLabel()
+        self._goal.setWordWrap(True)
+        self._goal.setFont(_display(11, QFont.Weight.DemiBold))
+        self._goal.setStyleSheet(f"color: {C.WHITE}; background: transparent;")
+        self._goal.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        right.addWidget(self._goal)
+
+        self._meta = QLabel()
+        self._meta.setFont(_mono(8))
+        self._meta.setWordWrap(True)
+        self._meta.setTextFormat(Qt.TextFormat.RichText)
+        self._meta.setStyleSheet("background: transparent;")
+        right.addWidget(self._meta)
+
+        self._now = QLabel()
+        self._now.setFont(_mono(8))
+        self._now.setWordWrap(True)
+        self._now.setStyleSheet(f"color: {C.GOLD}; background: transparent;")
+        right.addWidget(self._now)
+
+        right.addWidget(self._section("PLAN"))
+        self._plan = QLabel()
+        self._plan.setWordWrap(True)
+        self._plan.setFont(_mono(8))
+        self._plan.setTextFormat(Qt.TextFormat.RichText)
+        self._plan.setStyleSheet(f"background: {C.DARK}; border: 1px solid {C.BORDER};"
+                                 f" border-radius: 8px; padding: 8px;")
+        right.addWidget(self._plan)
+
+        right.addWidget(self._section("ACTIVITY"))
+        self._log = QTextEdit()
+        self._log.setReadOnly(True)
+        self._log.setFont(_mono(8))
+        self._log.setStyleSheet(f"""
+            QTextEdit {{ background: {C.DARK}; color: {C.TEXT};
+                         border: 1px solid {C.BORDER}; border-radius: 8px; padding: 6px;
+                         selection-background-color: {C.PRI_GHO}; }}
+            {self._scroll_qss()}""")
+        right.addWidget(self._log, 1)
+
+        self._result = QLabel()
+        self._result.setWordWrap(True)
+        self._result.setFont(_display(10))
+        self._result.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        right.addWidget(self._result)
+
+        # The agent's question, when it is waiting for one.
+        self._ask = QWidget()
+        al = QVBoxLayout(self._ask)
+        al.setContentsMargins(0, 0, 0, 0)
+        al.setSpacing(4)
+        self._ask_q = QLabel()
+        self._ask_q.setWordWrap(True)
+        self._ask_q.setFont(_display(10, QFont.Weight.DemiBold))
+        self._ask_q.setStyleSheet(f"color: {C.GOLD}; background: transparent;")
+        al.addWidget(self._ask_q)
+        row = QHBoxLayout()
+        row.setSpacing(6)
+        self._ask_in = QLineEdit()
+        self._ask_in.setFont(_mono(9))
+        self._ask_in.setFixedHeight(30)
+        self._ask_in.setPlaceholderText("Type your answer — or just say it to JARVIS")
+        self._ask_in.setStyleSheet(f"""
+            QLineEdit {{ background: #000d12; color: {C.TEXT};
+                         border: 1px solid {C.GOLD}; border-radius: 6px; padding: 4px 8px; }}""")
+        self._ask_in.returnPressed.connect(self._send_reply)
+        row.addWidget(self._ask_in, 1)
+        send = self._button("SEND", C.GOLD)
+        send.clicked.connect(self._send_reply)
+        row.addWidget(send)
+        al.addLayout(row)
+        right.addWidget(self._ask)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(6)
+        btns.addStretch(1)
+        self._resume_btn = self._button("RESUME", C.GREEN)
+        self._resume_btn.clicked.connect(lambda: self._act("resume"))
+        self._cancel_btn = self._button("CANCEL TASK", C.RED)
+        self._cancel_btn.clicked.connect(lambda: self._act("cancel"))
+        btns.addWidget(self._resume_btn)
+        btns.addWidget(self._cancel_btn)
+        right.addLayout(btns)
+
+        from PyQt6.QtWidgets import QSizeGrip
+        self._grip = QSizeGrip(self)
+        self._grip.setFixedSize(16, 16)
+        self._grip.setToolTip("Drag to resize")
+
+        # Running time ticks on its own; everything else changes only when the
+        # agent reports a change.
+        self._clock = QTimer(self)
+        self._clock.timeout.connect(self._render_meta)
+        self._clock.start(1000)
+        self._save_tmr = QTimer(self)
+        self._save_tmr.setSingleShot(True)
+        self._save_tmr.timeout.connect(self._save_geometry)
+        self._render()
+
+    # ── pieces ───────────────────────────────────────────────────────────
+    @staticmethod
+    def _scroll_qss() -> str:
+        return f"""
+            QScrollBar:vertical {{ background: transparent; width: 6px; border: none; margin: 4px 1px 4px 0; }}
+            QScrollBar::handle:vertical {{ background: {C.BORDER_B}; border-radius: 3px; min-height: 24px; }}
+            QScrollBar::handle:vertical:hover {{ background: {C.PRI_DIM}; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}"""
+
+    @staticmethod
+    def _section(text: str) -> QLabel:
+        l = QLabel(text)
+        l.setFont(_display(7.5, QFont.Weight.Bold, spacing=2.5))
+        l.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent; padding-top: 4px;")
+        return l
+
+    @staticmethod
+    def _button(text: str, color: str) -> QPushButton:
+        b = QPushButton(text)
+        b.setFont(_display(8, QFont.Weight.Bold, spacing=1.5))
+        b.setFixedHeight(30)
+        b.setCursor(Qt.CursorShape.PointingHandCursor)
+        b.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {color};
+                           border: 1px solid {color}; border-radius: 6px; padding: 0 14px; }}
+            QPushButton:hover {{ background: {C.PRI_GHO}; }}
+            QPushButton:disabled {{ color: {C.TEXT_DIM}; border-color: {C.BORDER}; }}""")
+        return b
+
+    @staticmethod
+    def _status(st: str) -> tuple[str, str]:
+        return {
+            "queued":          ("QUEUED", C.TEXT_MED),
+            "running":         ("RUNNING", C.PRI),
+            "waiting_user":    ("NEEDS YOU", C.GOLD),
+            "waiting_confirm": ("CONFIRM ON HUD", C.GOLD),
+            "done":            ("DONE", C.GREEN),
+            "failed":          ("FAILED", C.RED),
+            "cancelled":       ("CANCELLED", C.TEXT_DIM),
+            "interrupted":     ("INTERRUPTED", C.ACC),
+        }.get(st, (st.upper(), C.TEXT_MED))
+
+    def _current(self) -> dict | None:
+        for t in self._tasks:
+            if t.get("id") == self._sel:
+                return t
+        return None
+
+    # ── updates from the agent ───────────────────────────────────────────
+    def update_tasks(self, tasks: list, reveal: bool) -> None:
+        self._tasks = list(tasks or [])
+        live = [t for t in self._tasks if t.get("status") in ("running", "waiting_user",
+                                                              "waiting_confirm", "queued")]
+        # Follow the task that just asked for attention; otherwise keep the
+        # user's own pick.
+        if reveal and live:
+            want = next((t for t in live if t.get("status") in ("waiting_user", "waiting_confirm")),
+                        None) or next((t for t in live if t.get("status") == "running"), live[0])
+            self._sel = want.get("id", "")
+        elif not self._current() and self._tasks:
+            self._sel = self._tasks[0].get("id", "")
+        self._render()
+        if reveal:
+            self.reveal(activate=False)
+
+    def reveal(self, activate: bool = True) -> None:
+        if not self._placed:
+            self._place()
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, not activate)
+        if self.isMinimized():
+            self.showNormal()
+        elif not self.isVisible():
+            self.show()
+        if activate:
+            self.raise_()
+            self.activateWindow()
+
+    # ── drawing ──────────────────────────────────────────────────────────
+    def _render(self) -> None:
+        self._list.blockSignals(True)
+        self._list.clear()
+        for t in self._tasks:
+            label, color = self._status(t.get("status", ""))
+            goal = " ".join(str(t.get("goal", "")).split())
+            item = QListWidgetItem(f"● {label}\n{goal[:64]}{'…' if len(goal) > 64 else ''}")
+            item.setData(Qt.ItemDataRole.UserRole, t.get("id"))
+            item.setForeground(qcol(color))
+            item.setToolTip(goal)
+            self._list.addItem(item)
+            if t.get("id") == self._sel:
+                self._list.setCurrentItem(item)
+        self._list.blockSignals(False)
+        self._render_task()
+
+    def _on_pick(self, item, _prev=None) -> None:
+        if item is not None:
+            self._sel = item.data(Qt.ItemDataRole.UserRole) or ""
+            self._render_task()
+
+    def _render_task(self) -> None:
+        import html as _html
+        t = self._current()
+        has = t is not None
+        for w in (self._plan, self._log, self._resume_btn, self._cancel_btn):
+            w.setVisible(has)
+        if not has:
+            self._goal.setText("No tasks yet.")
+            self._meta.setText(
+                f"<span style='color:{C.TEXT_MED}'>Ask JARVIS for something that takes many "
+                f"steps — “research the best laptops under 80,000 rupees, compare them and save "
+                f"a report on my desktop” — and it runs here while you keep talking.</span>")
+            for w in (self._now, self._result, self._ask):
+                w.setVisible(False)
+            self._log_key = ()
+            return
+        st = t.get("status", "")
+        self._goal.setText(str(t.get("goal", "")))
+        self._render_meta()
+
+        now = str(t.get("current", "") or "")
+        self._now.setText(f"▶ {now}" if now and st in ("running", "waiting_user",
+                                                         "waiting_confirm") else "")
+        self._now.setVisible(bool(self._now.text()))
+
+        icons = {"done": ("✓", C.GREEN), "active": ("▶", C.GOLD),
+                 "skipped": ("–", C.TEXT_DIM), "pending": ("○", C.TEXT_MED)}
+        rows = []
+        for s in t.get("plan") or []:
+            ic, col = icons.get(s.get("status"), icons["pending"])
+            txt = _html.escape(str(s.get("title", "")))
+            if s.get("status") == "done":
+                txt = f"<span style='color:{C.TEXT_MED}'>{txt}</span>"
+            rows.append(f"<span style='color:{col}'>{ic}</span>&nbsp; {txt}")
+        self._plan.setText("<br>".join(rows) if rows else
+                           f"<span style='color:{C.TEXT_DIM}'>No plan yet.</span>")
+
+        self._render_log(t)
+
+        summary = str(t.get("summary", "") or "")
+        err = str(t.get("error", "") or "")
+        if summary or (err and st in ("failed", "interrupted")):
+            ok = t.get("outcome") == "success"
+            col = C.GREEN if ok else (C.RED if st == "failed" else C.GOLD)
+            self._result.setText(summary or err)
+            self._result.setStyleSheet(f"color: {C.WHITE}; background: {C.DARK};"
+                                       f" border: 1px solid {col}; border-radius: 8px; padding: 8px;")
+            self._result.setVisible(True)
+        else:
+            self._result.setVisible(False)
+
+        waiting = st == "waiting_user"
+        self._ask.setVisible(waiting)
+        if waiting:
+            self._ask_q.setText(f"?  {t.get('question', '')}")
+        self._cancel_btn.setVisible(st in ("queued", "running", "waiting_user", "waiting_confirm"))
+        self._resume_btn.setVisible(st in ("failed", "cancelled", "interrupted", "done"))
+        self._resume_btn.setText("CONTINUE" if st == "done" else "RESUME")
+
+    def _render_meta(self) -> None:
+        t = self._current()
+        if t is None:
+            return
+        st = t.get("status", "")
+        label, color = self._status(st)
+        worked = float(t.get("worked") or 0.0)
+        if st == "running" and t.get("updated"):
+            worked += max(0.0, time.time() - float(t["updated"]))
+        mins, secs = divmod(int(worked), 60)
+        bits = [f"<b style='color:{color}'>{label}</b>",
+                f"task {t.get('id', '')}",
+                f"{t.get('steps', 0)} step{'' if t.get('steps') == 1 else 's'}"]
+        if t.get("started"):
+            bits.append(f"{mins} min {secs:02d} s working")
+        if t.get("model"):
+            bits.append(str(t["model"]))
+        self._meta.setText(f"<span style='color:{C.TEXT_MED}'>"
+                           + "  ·  ".join(bits) + "</span>")
+
+    def _render_log(self, t: dict) -> None:
+        log = t.get("log") or []
+        key = (t.get("id"), log[0].get("t") if log else 0)
+        sb = self._log.verticalScrollBar()
+        at_end = sb.value() >= sb.maximum() - 4
+        if self._log_key[:2] == key and len(self._log_key) == 3 and self._log_key[2] <= len(log):
+            new = log[self._log_key[2]:]
+        else:
+            self._log.clear()
+            new = log
+        for e in new:
+            self._log.append(self._entry_html(e))
+        self._log_key = (*key, len(log))
+        if at_end or new is log:
+            # After the layout has caught up with what was just appended —
+            # straight away, the maximum is still the old one.
+            QTimer.singleShot(0, lambda: sb.setValue(sb.maximum()))
+
+    @staticmethod
+    def _entry_html(e: dict) -> str:
+        import html as _html
+        esc = lambda s, n=400: _html.escape(" ".join(str(s or "").split())[:n])
+        when = time.strftime("%H:%M:%S", time.localtime(float(e.get("t") or 0)))
+        ts = f"<span style='color:{C.TEXT_DIM}'>{when}</span>&nbsp; "
+        kind = e.get("kind")
+        text = e.get("text", "")
+        if kind == "tool":
+            res = esc(e.get("result", ""), 260)
+            secs = e.get("secs")
+            took = f" <span style='color:{C.TEXT_DIM}'>({secs} s)</span>" if secs else ""
+            return (f"{ts}<span style='color:{C.PRI}'>▸ {esc(text, 160)}</span>{took}"
+                    f"<br><span style='color:{C.TEXT_MED}'>&nbsp;&nbsp;&nbsp;↳ {res}</span>")
+        style = {
+            "think":    (C.TEXT_MED, "·"),
+            "note":     (C.GREEN, "✎"),
+            "say":      (C.WHITE, "◆"),
+            "tool_say": (C.TEXT_DIM, "↳"),
+            "ask":      (C.GOLD, "?"),
+            "reply":    (C.WHITE, "←"),
+            "error":    (C.RED, "✕"),
+            "done":     (C.GREEN, "✓"),
+        }.get(kind, (C.TEXT_DIM, "—"))
+        return f"{ts}<span style='color:{style[0]}'>{style[1]} {esc(text, 600)}</span>"
+
+    # ── actions ──────────────────────────────────────────────────────────
+    def _send_reply(self) -> None:
+        text = self._ask_in.text().strip()
+        if not text or not self._sel:
+            return
+        from core import agent as _agent
+        if _agent.manager().reply(self._sel, text) is not None:
+            self._ask_in.clear()
+
+    def _act(self, what: str) -> None:
+        if not self._sel:
+            return
+        from core import agent as _agent
+        m = _agent.manager()
+        (m.cancel if what == "cancel" else m.resume)(self._sel)
+
+    # ── where it goes ────────────────────────────────────────────────────
+    def _place(self) -> None:
+        """Where you left it last time if that screen still exists; otherwise
+        a second monitor if there is one, else beside JARVIS."""
+        self._placed = True
+        try:
+            from memory.config_manager import get_agent_window_geometry
+            g = get_agent_window_geometry()
+        except Exception:
+            g = None
+        if g:
+            x, y, w, h, maxed = g
+            r = QRect(x, y, w, h)
+            if any(sc.availableGeometry().intersects(r) for sc in QApplication.screens()):
+                self.setGeometry(r)
+                if maxed:
+                    self.setWindowState(Qt.WindowState.WindowMaximized)
+                return
+        home = self._anchor.screen() if self._anchor is not None else None
+        others = [sc for sc in QApplication.screens() if sc is not home]
+        screen = others[0] if others else (home or QApplication.primaryScreen())
+        av = screen.availableGeometry()
+        w = int(min(820, av.width() * 0.48))
+        h = int(min(860, av.height() * 0.86))
+        x = av.x() + (av.width() - w) // 2 if others else av.right() - w - 24
+        self.setGeometry(x, av.y() + (av.height() - h) // 2, w, h)
+
+    def _save_geometry(self) -> None:
+        if not self._placed:
+            return
+        r = self.normalGeometry() if self.isMaximized() else self.geometry()
+        if r.width() < 100 or r.height() < 100:
+            return
+        try:
+            from memory.config_manager import save_agent_window_geometry
+            save_agent_window_geometry(r.x(), r.y(), r.width(), r.height(), self.isMaximized())
+        except Exception:
+            pass
+
+    def closeEvent(self, e):
+        self._save_geometry()
+        super().closeEvent(e)
+
+    def moveEvent(self, e):
+        super().moveEvent(e)
+        if self.isVisible():
+            self._save_tmr.start(800)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._grip.move(self.width() - 18, self.height() - 18)
+        self._grip.raise_()
+        if self.isVisible():
+            self._save_tmr.start(800)
+
+
 class _DragBar(_OpaqueBar):
     """The header doubles as the title bar of the frameless window: drag to
     move (with the OS's own snapping, via startSystemMove), double-click to
@@ -2232,6 +2704,7 @@ class LogWidget(QTextEdit):
         "net":  ("NET",  "ACC",     "ACC2"),
         "file": ("FILE", "GREEN",   "GREEN"),
         "web":  ("WEB",  "VIOLET",  "TEXT"),
+        "agent": ("TASK", "GOLD",   "TEXT"),
         # SYS lines are the bulk of the log. TEXT_MED follows the theme and
         # drops the contrast to a level you can read past.
         "sys":  ("SYS",  "TEXT_DIM", "TEXT_MED"),
@@ -2243,7 +2716,7 @@ class LogWidget(QTextEdit):
         _ai_pfx = f"{self._ai_name_lc}:"
         for pfx, tag in (("you:", "you"), (_ai_pfx, "ai"), ("jarvis:", "ai"),
                          ("file:", "file"), ("err:", "err"), ("net:", "net"),
-                         ("[web]:", "web"), ("sys:", "sys")):
+                         ("[web]:", "web"), ("agent:", "agent"), ("sys:", "sys")):
             if tl.startswith(pfx):
                 return tag, text[len(pfx):].strip()
         return ("err" if "err" in tl[:12] else "sys"), text.strip()
@@ -4162,6 +4635,8 @@ class MainWindow(QMainWindow):
     _holo_cmd_sig   = pyqtSignal(str, float)       # (action, amount)
     _hands_sig      = pyqtSignal(object, object)   # (hands seen, gesture ops)
     _hands_state_sig = pyqtSignal(bool, str)       # (running, error)
+    _agent_sig      = pyqtSignal(object, bool)     # (task snapshots, reveal)
+    _agent_show_sig = pyqtSignal()
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -4431,6 +4906,8 @@ class MainWindow(QMainWindow):
             on_state=lambda on, err: self._hands_state_sig.emit(on, err))
         # Holograms open in their own window instead of over the HUD.
         self._holo_win = HoloWindow(anchor=self, on_hands_toggle=self._toggle_hands)
+        # The background agent's tasks, likewise in a window of their own.
+        self._agent_win = AgentWindow(anchor=self)
 
         # Quick-access drawer (floating overlay, built after central widget layout is done)
         self._quick_drawer = self._build_quick_drawer()
@@ -4476,6 +4953,8 @@ class MainWindow(QMainWindow):
         self._holo_cmd_sig.connect(self._on_holo_cmd)
         self._hands_sig.connect(self._on_hands)
         self._hands_state_sig.connect(self._on_hands_state)
+        self._agent_sig.connect(self._on_agent_update)
+        self._agent_show_sig.connect(lambda: self._agent_win.reveal(activate=True))
         self._cam_stop = threading.Event()
 
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
@@ -5206,6 +5685,17 @@ class MainWindow(QMainWindow):
         self._ctrl_btn.clicked.connect(self._toggle_controls)
         lay.addSpacing(4)
         lay.addWidget(self._ctrl_btn)
+        # The background agent's Tasks window. Shows how many tasks are live.
+        self._tasks_btn = QPushButton("◈")
+        self._tasks_btn.setFixedHeight(30)
+        self._tasks_btn.setMinimumWidth(30)
+        self._tasks_btn.setFont(_mono(11))
+        self._tasks_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tasks_btn.setToolTip("Tasks — what the background agent is working on")
+        self._tasks_btn.setStyleSheet(self._drawer_btn.styleSheet())
+        self._tasks_btn.clicked.connect(self._toggle_agent_window)
+        lay.addSpacing(4)
+        lay.addWidget(self._tasks_btn)
         lay.addStretch()
 
         mid = QVBoxLayout(); mid.setSpacing(1)
@@ -5385,6 +5875,29 @@ class MainWindow(QMainWindow):
             self._set_chip(self._chip_skills, f"{self._skills_count} SKILLS{facts}", C.PRI)
 
     # ── holograms ────────────────────────────────────────────────────────────
+    def _toggle_agent_window(self) -> None:
+        w = self._agent_win
+        if w.isVisible() and not w.isMinimized() and w.isActiveWindow():
+            w.close()
+        else:
+            w.reveal(activate=True)
+
+    def _on_agent_update(self, tasks, reveal: bool) -> None:
+        self._agent_win.update_tasks(tasks, reveal)
+        live = [t for t in tasks or [] if t.get("status") in
+                ("queued", "running", "waiting_user", "waiting_confirm")]
+        needs = any(t.get("status") in ("waiting_user", "waiting_confirm") for t in live)
+        self._tasks_btn.setText(f"◈ {len(live)}" if live else "◈")
+        color = C.GOLD if needs else (C.PRI if live else C.TEXT_MED)
+        border = C.GOLD if needs else (C.PRI_DIM if live else C.BORDER)
+        self._tasks_btn.setStyleSheet(f"""
+            QPushButton {{ background: {C.PANEL2}; color: {color}; padding: 0 6px;
+                           border: 1px solid {border}; border-radius: 8px; }}
+            QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI_DIM}; }}""")
+        self._tasks_btn.setToolTip(
+            "Tasks — " + (f"{len(live)} running or waiting" if live else "none running")
+            + (" · one needs you" if needs else ""))
+
     def _on_holo_show(self, model, rid: int) -> None:
         self._holo_win.show_model(model, rid)
         self._log.append_log(f"SYS: Hologram — {model.title} ({model.size_text}), "
@@ -7238,6 +7751,13 @@ class JarvisUI:
                 "computer only. Pinch thumb and index and move to rotate, make a "
                 "fist and move to drag, pinch with both hands and pull apart to "
                 "scale or twist to roll.")
+
+    # Background agent — thread-safe (called from the agent's own thread).
+    def update_agent_tasks(self, tasks, reveal: bool = False) -> None:
+        self._win._agent_sig.emit(list(tasks or []), bool(reveal))
+
+    def show_agent_window(self) -> None:
+        self._win._agent_show_sig.emit()
 
     def set_startup_info(self, skills: int, facts: int) -> None:
         """Thread-safe: how many skills were actually loaded and how many

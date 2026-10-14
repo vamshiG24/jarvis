@@ -30,6 +30,9 @@ memory/*.db
 # The last conversation, kept so a crash or restart can continue it
 memory/session_state.json
 memory/session_state.tmp
+# The background agent's tasks: goals, plans and what each step found
+memory/agent_tasks.json
+memory/agent_tasks.tmp
 
 # ── Python build noise ────────────────────────────────────────────────────────
 __pycache__/

@@ -17,7 +17,30 @@ reminders and more. There's no subscription; you only need a free Gemini API key
 
 ## 🆕 What's new in this build
 
-On top of MARK LV, this build adds 3D holograms you can turn with your hands, a fix for the Live session crash, a 3D Iron Man-style interface, and a round of correctness fixes.
+On top of MARK LV, this build adds an agent that does long, multi-step tasks in the background, 3D holograms you can turn with your hands, a fix for the Live session crash, a 3D Iron Man-style interface, and a round of correctness fixes.
+
+### 🛰️ Agent mode — long, multi-step work in the background
+
+Give JARVIS a job instead of a command: "research what's new in the Gemini API
+this month and save a report on my desktop", "compare this weekend's weather in
+three cities and tell me where to go", "find the Raspberry Pi 5 at two Indian
+stores and tell me which is cheaper". JARVIS hands it to its **agent** and keeps
+talking to you. The agent plans the job, works through it with the same tools
+JARVIS has, and reports back by voice when it's done or needs you.
+
+| | |
+|---|---|
+| 🧭 **Plans, then acts** | It writes a plan of 3–8 steps, works through them one tool call at a time (search, read pages, files, apps, browser, code, the screen), ticks steps off and revises the plan when something changes the route. Facts come from tool results in that task, not from the model's memory. |
+| 🪟 **Its own window** | The **◈** button in the header opens **AGENT // TASKS**, a window of its own like the hologram's, so the HUD is never covered. Each task shows its goal, plan, every step with what it returned, the model doing the work, and the result. The button shows how many tasks are live and turns gold when one needs you. |
+| 🗣️ **Talks only when it matters** | Questions, a rare milestone and the final result are spoken at a quiet moment: never over JARVIS, never while you're mid-sentence. Narration from tools ("Searching flights now, sir") goes to the task log instead of your speakers. |
+| ❓ **Asks when it's stuck** | If only you can decide something, it asks out loud. Answer by voice, or type it in the task window. Waiting for you doesn't count against its time budget. |
+| ⚠️ **Same safety gate** | Anything irreversible still needs your CONFIRM press on the HUD, and the agent is told whether you confirmed or cancelled. It's told never to send, post, buy or delete anything the goal didn't ask for. |
+| 💾 **Survives a crash** | Every step is saved to `memory/agent_tasks.json`. If JARVIS closes mid-task, the task shows as INTERRUPTED and JARVIS offers to resume it. A resumed task continues from its plan and notes; finished steps aren't replayed. |
+| 🪜 **Long tasks don't die on quota** | When a model runs out of quota, is overloaded or garbles a tool call, the next model on the agent ladder carries on mid-task. If every model is down it waits and retries. On long tasks older steps are condensed into a summary, while the plan and notes are kept in full. |
+
+Say "how's the task going?", "cancel the task" or "resume the task" at any time.
+One task runs at a time, because they share one mouse, keyboard and browser.
+Others queue behind it.
 
 ### 🪐 Holograms — answers you can pick up and turn
 
@@ -189,6 +212,7 @@ Nexus sphere renders in about 5 ms per frame, and idle repaint stays at around 2
 | Feature | Description |
 |---|---|
 | 🎙️ Real-time voice | Low-latency conversation in any language via Gemini Live |
+| 🛰️ Agent mode | Long, multi-step tasks run in the background with a plan, every tool, a task window and a spoken report. Survives crashes and quota limits |
 | 🪐 Holograms | 3D answers designed by Gemini, or your own `.obj` / `.stl`, in their own window. Rotate, move and zoom them |
 | ✋ Hand control | Pinch, fist and two-hand gestures through the webcam, processed on your machine |
 | ✦ Nexus / 🧑 Face / ◉ Core HUD | Three software-rendered centrepieces that react to state and voice |
@@ -219,7 +243,7 @@ Nexus sphere renders in about 5 ms per frame, and idle repaint stays at around 2
 ```bash
 git clone https://github.com/vamshiG24/jarvis.git
 cd jarvis
-git checkout feature/holo-objects   # holograms + hand control, until merged into main
+git checkout feature/agent-mode     # agent mode + holograms, until merged into main
 python setup.py        # installs dependencies for YOUR OS + Playwright browsers
 python main.py
 ```
@@ -265,6 +289,10 @@ These are the advanced keys:
 |---|---|---|
 | `hud_style` | `"stark"` | `stark`, `nexus`, `face` or `core`. Cycle with 🎛 → HUD |
 | `holo_window` | *(unset)* | Where the hologram window last was: `[x, y, w, h, maximised]`. Saved automatically when you move or resize it; delete it to reset |
+| `agent_window` | *(unset)* | The same for the Tasks window |
+| `agent_model` | *(unset)* | Put a specific REST model first on the agent ladder, e.g. `gemini-3.8-flash`. The rest stay behind it as fallbacks |
+| `agent_max_steps` | `120` | Tool calls per run of a task before it has to report what it has |
+| `agent_max_minutes` | `90` | Working minutes per run (time spent waiting for you isn't counted) |
 | `context_compression` | `"auto"` | `auto` = off on Gemini 3.x Live (avoids 1011s), on for 2.5. Use `true` or `false` to force it |
 | `live_model` | *(unset)* | Put a specific Live model first, e.g. `gemini-3.8-live-extended-thinking` for deeper reasoning (slower first word) |
 | `thinking_enabled` | `false` | Lets 2.5 / 3.1 Live models reason before answering. 3.8 reasons on its own and ignores this. |
@@ -297,6 +325,9 @@ These are the advanced keys:
 | `Hand control could not start: the webcam … could not be opened` | Another app (Teams, Zoom, the Camera app) has the camera | Close it and switch hand control on again |
 | `[Dashboard] Port 8000 is already in use` | Another program, or a previous JARVIS still closing, holds the port | None for the assistant, which runs normally; only phone remote control is off for that run. Before this build, this silently stopped the whole assistant behind a working window |
 | `[Holo] refinement ready after …s — too late to swap` | The rich hologram design took over 100 s | None. The quick design stays on screen |
+| Task log: `Every model is busy or out of quota — retrying in N s` | Every model on the agent ladder is resting | None. The task waits and carries on. On the free tier, long tasks can use up the day's text-model quota; `agent_model` or a paid key helps |
+| Task log: `… garbled a tool call — trying another model` | The model returned a malformed function call | None. The next model takes the turn |
+| A task shows **INTERRUPTED** | JARVIS closed while it was running | Say "resume the task" or press RESUME in the Tasks window |
 
 ---
 
@@ -313,7 +344,8 @@ Mark-LV/
 ├── plugins/             # Drop-in skills (_template.py shows the shape)
 ├── core/                # gemini ladder, loaders, echo guard, visemes, avatar, wake word,
 │                        # audio devices, undo, confirm gate, prompt.txt,
-│                        # hud3d (Stark scene), holo3d (holograms), hands (gestures)
+│                        # hud3d (Stark scene), holo3d (holograms), hands (gestures),
+│                        # agent (the background task agent)
 ├── models/              # downloaded on first use: the hand model (git-ignored)
 ├── memory/              # memory_manager (long_term.json), config_manager (api_keys.json)
 ├── dashboard/           # FastAPI phone remote + static pages
@@ -336,6 +368,7 @@ Everything stays on your machine. There's no server, telemetry or account.
 | Dashboard TLS key and certificate | `config/certs/` | Self-signed and generated locally |
 | What the assistant remembers | `memory/long_term.json` | Delete it to make the assistant forget everything |
 | The last conversation (for continuing after a crash or restart) | `memory/session_state.json` | Plain text, the last 24 lines. Ignored after 6 h (crash) or 2 h (normal close). Delete it to start fresh |
+| The agent's tasks: goals, plans, notes and what each step returned | `memory/agent_tasks.json` | The last 30 tasks. Delete it to clear the Tasks window |
 | The hand model, if you use hand control | `models/hand_landmarker.task` | Google's MediaPipe model, downloaded once. **Webcam frames are never written anywhere** |
 
 All three are git-ignored (this build fixed the rules that silently didn't

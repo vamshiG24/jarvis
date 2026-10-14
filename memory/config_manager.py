@@ -325,6 +325,20 @@ def save_holo_window_geometry(x: int, y: int, w: int, h: int, maximised: bool) -
     _patch_config(holo_window=[int(x), int(y), int(w), int(h), bool(maximised)])
 
 
+# ── Tasks window ─────────────────────────────────────────────────────────────
+# The background agent's window, remembered the same way.
+
+def get_agent_window_geometry() -> list | None:
+    g = load_api_keys().get("agent_window")
+    if isinstance(g, list) and len(g) == 5 and all(isinstance(v, (int, bool)) for v in g):
+        return g
+    return None
+
+
+def save_agent_window_geometry(x: int, y: int, w: int, h: int, maximised: bool) -> None:
+    _patch_config(agent_window=[int(x), int(y), int(w), int(h), bool(maximised)])
+
+
 # ── Audio devices ────────────────────────────────────────────────────────────
 # Stored as device NAMES, not sounddevice indices. Indices shift every time a
 # USB device is plugged in or removed, so a saved index silently starts pointing

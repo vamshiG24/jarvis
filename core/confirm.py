@@ -53,10 +53,19 @@ class _Pending:
     detail:  str
     run:     Callable[[], str]
     at:      float
+    seq:     int = 0
 
 
 _pending: Optional[_Pending] = None
 _lock = threading.Lock()
+
+# What became of each request, by sequence number, for a caller that has to
+# wait for the answer rather than talk over it — the background agent, which
+# cannot carry on with a plan while it does not know whether a step happened.
+# The conversation never waits: it is told to ask, and the log says the rest.
+_seq = 0
+_outcomes: dict[int, tuple[str, str]] = {}      # seq -> (status, result)
+_outcome_cv = threading.Condition()
 
 # Set once at startup by main.py. Signature: (title, detail) -> None for show,
 # and () -> None for hide. Both are marshalled onto the Qt thread by the UI.
@@ -85,7 +94,7 @@ def request(key: str, title: str, detail: str, run: Callable[[], str]) -> str:
     Returns the sentence the tool should hand back to the model — phrased as an
     instruction so the assistant asks the user out loud in their own language,
     rather than reading an English string verbatim."""
-    global _pending
+    global _pending, _seq
 
     if _show_cb is None:
         # No interface bound (headless, or a very early call). Refuse rather
@@ -94,8 +103,9 @@ def request(key: str, title: str, detail: str, run: Callable[[], str]) -> str:
                 f"not available, so I have not done it.")
 
     with _lock:
+        _seq += 1
         _pending = _Pending(key=key, title=title, detail=detail,
-                            run=run, at=time.monotonic())
+                            run=run, at=time.monotonic(), seq=_seq)
 
     try:
         _show_cb(title, detail)
@@ -134,21 +144,57 @@ def resolve(accepted: bool) -> None:
 
     if time.monotonic() - p.at > TIMEOUT_SECONDS:
         _log(f"SYS: Confirmation expired — {p.title}")
+        _settle(p.seq, "expired", "")
         return
 
     if not accepted:
         _log(f"SYS: Cancelled — {p.title}")
+        _settle(p.seq, "cancelled", "")
         return
 
     def _worker():
         try:
             result = p.run() or "Done."
             _log(f"SYS: Confirmed — {p.title}. {result}")
+            _settle(p.seq, "confirmed", str(result))
         except Exception as e:
             _log(f"ERR: {p.title} failed — {e}")
+            _settle(p.seq, "failed", str(e))
 
     threading.Thread(target=_worker, daemon=True,
                      name=f"confirm-{p.key}").start()
+
+
+def _settle(seq: int, status: str, result: str) -> None:
+    with _outcome_cv:
+        _outcomes[seq] = (status, result)
+        while len(_outcomes) > 20:
+            _outcomes.pop(min(_outcomes))
+        _outcome_cv.notify_all()
+
+
+def latest_seq() -> int:
+    """The sequence number of the most recent request — read it right after a
+    tool answered [CONFIRMATION_PENDING] to know which answer to wait for."""
+    with _lock:
+        return _seq
+
+
+def wait_outcome(seq: int, timeout: float = TIMEOUT_SECONDS + 5,
+                 cancelled: Optional[Callable[[], bool]] = None) -> tuple[str, str]:
+    """Block until request `seq` is confirmed, cancelled or expires.
+
+    Returns (status, result): status is 'confirmed', 'cancelled', 'failed' or
+    'expired'. Never call this from the Qt thread or the event loop — the
+    answer arrives through a button on that very thread."""
+    deadline = time.monotonic() + timeout
+    with _outcome_cv:
+        while seq not in _outcomes:
+            left = deadline - time.monotonic()
+            if left <= 0 or (cancelled and cancelled()):
+                return "expired", ""
+            _outcome_cv.wait(min(1.0, left))
+        return _outcomes[seq]
 
 
 def pending_title() -> str:

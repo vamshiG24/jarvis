@@ -303,9 +303,11 @@ flowchart TB
     end
     OVER["Floating overlays<br/>Setup · Customise · Audio devices · Memory · Plugins<br/>Remote QR · Confirm banner · Clipboard · Camera preview"]
     HOLOWIN["HoloWindow — a separate top-level window<br/>holograms · hand cursors (see Holograms below)"]
+    AGENTWIN["AgentWindow — a separate top-level window<br/>background tasks · plan · step log (see §7)"]
     CANVAS -.->|centres scene on| STACK
     WIN --- OVER
     WIN -.->|opens on demand| HOLOWIN
+    WIN -.->|"◈ button, or a task starts / needs you"| AGENTWIN
 ```
 
 **Why the panels are opaque.** The scene repaints 20–30 times a second. Qt
@@ -381,7 +383,92 @@ kept in memory only: one frame at a time, replaced by the next.
 
 ---
 
-## 7. Module map
+## 7. The background agent
+
+The Live conversation is the wrong place for a twenty-step job. A tool call
+holds the voice turn, so a chain of them is a long silence, and long tool
+calls are a 1011 risk on the 3.x Live models. The conversation's context
+belongs to the user, and page dumps push their words out of it. And a plan
+held only in a Live session dies with the session at the next GoAway or quota
+fail-over. So long work is handed off.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant G as Gemini Live
+    participant T as agent_task (action)
+    participant A as AgentManager thread<br/>(core/agent.py)
+    participant R as Gemini REST<br/>AGENT ladder
+    participant W as Tasks window
+    participant N as _run_agent_announcer
+
+    U->>G: "research X, compare, save a report"
+    G->>T: agent_task(start, goal)
+    T->>A: start(goal) — returns at once
+    T-->>G: [AGENT_STARTED] — one sentence, keep talking
+    G-->>U: "On it, sir."
+    loop until finish / budget / cancel
+        A->>R: generate_content(history, tools)
+        R-->>A: function_call(s)
+        A->>A: run tool (actions · plugins · own tools)
+        A->>W: snapshot (plan, step, result)
+    end
+    A->>N: announce(result, urgent)
+    N->>G: [BACKGROUND TASK UPDATE] at a quiet moment
+    G-->>U: the result, in the user's language
+```
+
+**What it can use.** Every action and plugin, through `JarvisLive._agent_execute`.
+The registries are the same; the only difference is `speak`, which writes to
+the task log instead of the speakers. On top of those it has its own tools:
+`update_plan`, `note`, `read_webpage` (requests + BeautifulSoup, read in
+12,000-character parts), `look_at_screen` (screenshot → vision model → text),
+`system_status`, `recall_memory`, `wait`, `tell_user`, `ask_user` and `finish`.
+It is never given `agent_task` itself, `holo_control` or `shutdown_jarvis`.
+
+```mermaid
+flowchart TB
+    START["queued → running<br/>brief = goal (+ plan, notes, digest when resumed)"] --> CHK{"cancelled?<br/>budget spent?"}
+    CHK -->|budget| WRAP["one last turn: finish now<br/>(partial result, never silence)"]
+    CHK -->|no| SIZE{"history > 140k chars?"}
+    SIZE -->|yes| COMPACT["older turns → digest (SMART ladder)<br/>keep plan + notes + last 8 turns"]
+    SIZE -->|no| GEN
+    COMPACT --> GEN["generate on the AGENT ladder"]
+    GEN -->|"quota / 503 / 500"| NEXT["rest that model → next rung<br/>all down: wait 15 s → 30 s → … and retry"]
+    NEXT --> GEN
+    GEN -->|"400 about thought signatures"| FLAT["carry the task over as text<br/>(compaction with nothing kept)"] --> GEN
+    GEN -->|"MALFORMED_FUNCTION_CALL"| AVOID["that model goes to the back<br/>of the ladder for this run"] --> CHK
+    GEN -->|"function calls"| RUN["run each tool · log it · save"]
+    RUN -->|"[CONFIRMATION_PENDING]"| CONF["wait for CONFIRM / CANCEL<br/>(core/confirm.wait_outcome)"] --> CHK
+    RUN -->|ask_user| ASK["status NEEDS YOU · spoken question<br/>answer by voice (agent_task reply) or in the window"] --> CHK
+    RUN --> CHK
+    GEN -->|finish| DONE["done / failed + summary · spoken result"]
+```
+
+**Speaking.** `tell_user`, `ask_user`, the confirmation gate and the result each
+go into `JarvisLive._agent_notes`. A lifetime task (`_run_agent_announcer`)
+sends one at a time as a tagged user turn, and only when JARVIS isn't speaking,
+the echo tail has expired, the assistant is awake, and the user has been quiet
+for 3 s (urgent) or 10 s (progress). Spoken progress is limited to one a minute.
+
+**Continuity.** `memory/agent_tasks.json` is written atomically after every
+status change and at most every 2 s otherwise. On the next launch, a task that
+was queued, running or waiting becomes INTERRUPTED. The crash greeting
+(`[RESUMED]`) says so itself, because without it the restored transcript reads
+like a request still to be done, and the Live model once did the whole job
+again on its own. Otherwise it's announced. `resume` rebuilds the context from
+the plan, notes, digest and the last 25 log entries, and tells the model to
+check the current state before redoing anything with side effects.
+
+**One at a time.** Tasks share one mouse, one keyboard and one browser, so one
+runs and the rest queue. A cancel takes effect after the current tool call
+returns. If the task was waiting on a confirmation, its banner is withdrawn so
+it can't be confirmed later.
+
+---
+
+## 8. Module map
 
 ```mermaid
 flowchart LR
@@ -406,6 +493,7 @@ flowchart LR
         H3D["hud3d.py — Stark scene"]
         HOLO["holo3d.py — hologram models + view"]
         HANDS["hands.py — webcam gestures"]
+        AGENT["agent.py — background task agent"]
         PROMPT["prompt.txt"]
     end
     subgraph MEMPKG["memory/"]
@@ -418,13 +506,14 @@ flowchart LR
         A3["computer_settings · computer_control · desktop"]
         A4["reminder · weather_report · send_message · …"]
         A5["holo_show · holo_control"]
+        A6["agent_task"]
     end
     DASHB["dashboard/server.py"] --> MAINPY
 ```
 
 ---
 
-## 8. Data on disk
+## 9. Data on disk
 
 | File | Contents | In git? |
 |---|---|---|
@@ -432,6 +521,7 @@ flowchart LR
 | `config/certs/` | Self-signed TLS key and certificate for the phone dashboard | ❌ ignored |
 | `memory/long_term.json` | What the assistant remembers about you, plus session summaries | ❌ ignored |
 | `memory/session_state.json` | The last 24 lines of conversation, for continuing after a crash or restart | ❌ ignored |
+| `memory/agent_tasks.json` | The background agent's last 30 tasks: goal, plan, notes, step log, result | ❌ ignored |
 | `models/hand_landmarker.task` | MediaPipe hand model, downloaded the first time hand control is switched on | ❌ ignored |
 | `core/prompt.txt` | System-prompt template; `{tokens}` are filled in at connect | ✅ |
 | `core/face_model.obj` | MediaPipe canonical face (Apache-2.0) | ✅ |

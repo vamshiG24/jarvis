@@ -80,6 +80,7 @@ from core                     import gemini as _gemini
 from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
+from core                      import agent as agent_core
 from core                      import audio_devices
 from core.action_loader        import discover_actions
 from core.echo                 import EchoGuard
@@ -762,6 +763,13 @@ class JarvisLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        # What the background agent wants said: (text, urgent), spoken by
+        # _run_agent_announcer at the next quiet moment. Appended from the
+        # agent's thread; deque appends and pops are thread-safe.
+        self._agent_notes: collections.deque = collections.deque(maxlen=20)
+        # Agent tasks the last shutdown cut off; None until the first session
+        # has looked. See the first-session block in run().
+        self._agent_stopped: list | None = None
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
         self._tuned_live    = True  # turn-taking / media / thinking knobs; same fallback
@@ -2445,6 +2453,12 @@ class JarvisLive:
                    f"conversation so far is restored. In a few words, say you are "
                    f"back and ready to continue. Do not greet the user from "
                    f"scratch and do not repeat your last answer.{lang}")
+        # Work the agent had in hand stopped too. Without saying so, the
+        # restored transcript reads like a request still to be done, and the
+        # model did it all again itself.
+        if self._agent_stopped:
+            msg += " " + self._agent_stopped_text() + " Fit it into the same short reply."
+            self._agent_stopped = []
         try:
             await self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": msg}]},
@@ -2651,6 +2665,64 @@ class JarvisLive:
             except Exception as e:
                 print(f"[Proactive] ⚠️ {e}")
 
+    # ── Background agent ────────────────────────────────────────────────────────
+
+    def _agent_execute(self, name: str, args: dict, say) -> str:
+        """Run one action or plugin for the background agent, on its thread.
+
+        The same registries the conversation uses. The one difference is
+        `speak`: an action that narrates itself ("Searching flights now, sir")
+        would make JARVIS talk over whatever the user is doing, so for the
+        agent that narration goes to the task's log instead."""
+        if name == "file_processor" and not args.get("file_path") and self.ui.current_file:
+            args["file_path"] = self.ui.current_file
+        if self._action_registry.has(name):
+            ctx = {"player": self.ui, "speak": say, "response": None, "session_memory": None}
+            return self._action_registry.run(name, args, ctx)
+        if self._plugin_registry.has(name):
+            return self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
+        return f"Unknown tool: {name}"
+
+    def _agent_stopped_text(self) -> str:
+        tasks = self._agent_stopped or []
+        names = "; ".join(f'"{t.goal[:90]}" (task {t.id})' for t in tasks[-3:])
+        return (f"Your background agent was working on {names} when the app closed, and "
+                f"it stopped with it. Do NOT do that work yourself — offer to resume it "
+                f"(agent_task action 'resume'), which carries on from its plan and notes.")
+
+    async def _run_agent_announcer(self) -> None:
+        """Speak what the background agent has to say, at a quiet moment.
+
+        Lifetime task: a note waits through reconnects instead of being lost
+        with a session. Urgent ones (a question, the result) go out once the
+        user has been quiet for a few seconds; a progress update waits for a
+        longer pause. Never over JARVIS's own voice, never while asleep."""
+        while True:
+            await asyncio.sleep(1.0)
+            if not self._agent_notes or not self.session or not self._awake:
+                continue
+            with self._speaking_lock:
+                speaking = self._is_speaking
+            if speaking or self._tail_active():
+                continue
+            text, urgent = self._agent_notes[0]
+            if time.monotonic() - self._last_user_speech < (3.0 if urgent else 10.0):
+                continue
+            msg = (f"[BACKGROUND TASK UPDATE — from your agent, not from the user]\n{text}\n"
+                   f"Say it to the user naturally, in the language you are speaking with them. "
+                   f"Do not call agent_task unless they ask for something.")
+            try:
+                await self.session.send_client_content(
+                    turns={"role": "user", "parts": [{"text": msg}]},
+                    turn_complete=True,
+                )
+                self._agent_notes.popleft()
+                print(f"[Agent] 🔊 announced: {text[:90]}")
+                await asyncio.sleep(4.0)       # let one finish before the next
+            except Exception as e:
+                print(f"[Agent] ⚠️ Could not announce yet: {e}")
+                await asyncio.sleep(3.0)
+
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
     async def _relay_phone_audio(self) -> None:
@@ -2725,6 +2797,19 @@ class JarvisLive:
             log  = self.ui.write_log,
         )
         set_trim_notifier(self.ui.write_log)
+
+        # The background agent gets the same tools the conversation has, the
+        # Tasks window, and a voice through the announcer below.
+        agent_core.bind(
+            tools     = lambda: (self._action_registry.get_tool_declarations()
+                                 + self._plugin_registry.get_tool_declarations()),
+            execute   = self._agent_execute,
+            on_change = self.ui.update_agent_tasks,
+            announce  = lambda text, urgent: self._agent_notes.append((text, urgent)),
+            log       = self.ui.write_log,
+            assistant = self.ui.assistant_name,
+        )
+        asyncio.create_task(self._run_agent_announcer())
 
         # Tell the device picker the exact rates the streams open at, from the
         # constants that actually open them — so it can never list a device that
@@ -2864,13 +2949,22 @@ class JarvisLive:
                     # minutes — is a continuation, not a new day: no
                     # greeting from scratch, no news. Skipped in wake-word
                     # mode, which comes up asleep.
+                    if self._agent_stopped is None:
+                        self._agent_stopped = agent_core.manager().take_stopped()
+                    greeting = False
                     if not self._briefing_sent and self._awake:
                         self._briefing_sent = True
                         info = self._resume_info
                         if info and (not info.get("clean_exit") or info.get("age", 1e9) < 600):
+                            greeting = True
                             tg.create_task(self._send_resume_greeting(info))
                         elif get_brief_enabled():
                             tg.create_task(self._send_startup_briefing())
+                    # The crash greeting mentions cut-off agent tasks itself;
+                    # otherwise they are announced at the next quiet moment.
+                    if self._agent_stopped and not greeting:
+                        self._agent_notes.append((self._agent_stopped_text(), False))
+                        self._agent_stopped = []
 
             except KeyboardInterrupt:
                 raise

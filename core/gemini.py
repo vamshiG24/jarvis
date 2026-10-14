@@ -177,6 +177,20 @@ STRUCTURED_RICH = "structured_rich"
 _LADDERS[STRUCTURED_RICH] = ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash",
                              "gemini-2.5-flash")
 
+# The background agent (core/agent.py): many turns of function calling over the
+# app's own tools. REST only — a Live one-shot turn can only speak, it cannot
+# return a function call. Reasoning leads, because a long task is won or lost on
+# its plan; but every rung here was checked doing real multi-turn tool calls on
+# this key (2026-10-14): 3.1-flash-lite called weather_report, read the result
+# and called finish in 1.3 s + 2.4 s, and 2.5-flash did the same in 2.1 s. The
+# 3.5-3.8 flash models answered 503 "high demand" that afternoon, which is
+# exactly the case a ladder exists for. "agent_model" in the config puts a
+# model of your choosing in front (see agent_ladder).
+AGENT = "agent"
+_LADDERS[AGENT] = ("gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash",
+                   "gemini-2.5-flash", "gemini-3.1-flash-lite", "gemini-flash-latest",
+                   "gemini-2.5-flash-lite")
+
 # The conversation's own model, and careful fallbacks behind it.
 #
 # Deliberately short. Live models are not interchangeable the way text models
@@ -620,21 +634,45 @@ def call(contents, tier: str = FAST, config=None,
                 kwargs["config"] = config
             return cl.models.generate_content(**kwargs)
         except Exception as e:
-            msg = str(e)
-            if is_quota_error(msg):
-                _cool(model)
-                print(f"[Gemini] {model}: out of quota — skipping it for "
-                      f"{_COOLDOWN_SECONDS // 60} minutes")
-            elif is_gone_error(msg):
-                _cool(model, _GONE_SECONDS)
-                print(f"[Gemini] {model}: unavailable to this key — set aside")
-            elif is_unavailable_error(msg):
-                _cool(model, _UNAVAILABLE_SECONDS)
-                print(f"[Gemini] {model}: not answering — resting it for "
-                      f"{_UNAVAILABLE_SECONDS // 60} minutes")
-            else:
-                print(f"[Gemini] {model}: {type(e).__name__}: {msg[:140]}")
+            note_failure(model, e)
     return None
+
+
+def note_failure(model: str, err) -> bool:
+    """Rest a REST rung that failed for a reason of its own — quota, gone, or
+    overloaded — and say so. True when it was rested, so the caller knows the
+    next rung is the right move; False for anything else (a bad request is the
+    caller's fault, not the model's, and resting the model would not help)."""
+    msg = str(err)
+    if is_quota_error(msg):
+        _cool(model)
+        print(f"[Gemini] {model}: out of quota — skipping it for "
+              f"{_COOLDOWN_SECONDS // 60} minutes")
+        return True
+    if is_gone_error(msg):
+        _cool(model, _GONE_SECONDS)
+        print(f"[Gemini] {model}: unavailable to this key — set aside")
+        return True
+    if is_unavailable_error(msg):
+        _cool(model, _UNAVAILABLE_SECONDS)
+        print(f"[Gemini] {model}: not answering — resting it for "
+              f"{_UNAVAILABLE_SECONDS // 60} minutes")
+        return True
+    print(f"[Gemini] {model}: {type(err).__name__}: {msg[:140]}")
+    return False
+
+
+def agent_ladder() -> tuple[str, ...]:
+    """The AGENT ladder with the user's "agent_model" choice (if any) in front,
+    the same way "live_model" works for the conversation."""
+    try:
+        data = json.loads(_KEY_FILE.read_text(encoding="utf-8"))
+        want = str(data.get("agent_model") or "").strip()
+    except Exception:
+        want = ""
+    want = want.removeprefix("models/")
+    ladder = _LADDERS[AGENT]
+    return ((want,) + tuple(m for m in ladder if m != want)) if want else ladder
 
 
 def text(contents, tier: str = FAST, config=None,
