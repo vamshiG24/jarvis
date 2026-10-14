@@ -22,9 +22,9 @@ On top of MARK LV, this build adds an agent that does long, multi-step tasks in 
 ### 🛰️ Agent mode — long, multi-step work in the background
 
 Give JARVIS a job instead of a command: "research what's new in the Gemini API
-this month and save a report on my desktop", "compare this weekend's weather in
-three cities and tell me where to go", "find the Raspberry Pi 5 at two Indian
-stores and tell me which is cheaper". JARVIS hands it to its **agent** and keeps
+this month", "compare this weekend's weather in three cities and tell me where
+to go", "find the Raspberry Pi 5 at two Indian stores and tell me which is
+cheaper". JARVIS hands it to its **agent** and keeps
 talking to you. The agent plans the job, works through it with the same tools
 JARVIS has, and reports back by voice when it's done or needs you.
 
@@ -34,11 +34,12 @@ JARVIS has, and reports back by voice when it's done or needs you.
 | 🪟 **Its own window** | The **◈** button in the header opens **AGENT // TASKS**, a window of its own like the hologram's, so the HUD is never covered. Each task shows its goal, plan, every step with what it returned, the model doing the work, and the result. The button shows how many tasks are live and turns gold when one needs you. |
 | 🗣️ **Talks only when it matters** | Questions, a rare milestone and the final result are spoken at a quiet moment: never over JARVIS, never while you're mid-sentence. Narration from tools ("Searching flights now, sir") goes to the task log instead of your speakers. |
 | ❓ **Asks when it's stuck** | If only you can decide something, it asks out loud. Answer by voice, or type it in the task window. Waiting for you doesn't count against its time budget. |
+| 📄 **No files unless you say so** | Every task starts with files **off**: the answer comes back by voice and in the Tasks window, and any attempt to create or write a file (`file_controller`, `code_helper`, `dev_agent`) is refused before it runs. Files are allowed only when you explicitly ask, either when giving the task ("…and save it as a report on my desktop") or afterwards ("save that to a file"), which reopens the task to write it. The Tasks window shows `files on` / `files off`. |
 | ⚠️ **Same safety gate** | Anything irreversible still needs your CONFIRM press on the HUD, and the agent is told whether you confirmed or cancelled. It's told never to send, post, buy or delete anything the goal didn't ask for. |
 | 💾 **Survives a crash** | Every step is saved to `memory/agent_tasks.json`. If JARVIS closes mid-task, the task shows as INTERRUPTED and JARVIS offers to resume it. A resumed task continues from its plan and notes; finished steps aren't replayed. |
 | 🪜 **Long tasks don't die on quota** | When a model runs out of quota, is overloaded or garbles a tool call, the next model on the agent ladder carries on mid-task. If every model is down it waits and retries. On long tasks older steps are condensed into a summary, while the plan and notes are kept in full. |
 
-Say "how's the task going?", "cancel the task" or "resume the task" at any time.
+Say "how's the task going?", "save that to a file", "cancel the task" or "resume the task" at any time.
 One task runs at a time, because they share one mouse, keyboard and browser.
 Others queue behind it.
 

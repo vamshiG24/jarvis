@@ -40,6 +40,14 @@ LONG TASKS
       asks the model for its best summary — never silence.
 
 SAFETY
+    No files unless the user asked for one. A task starts with files OFF: a
+    call that would create or write a file is refused before it runs (see
+    _writes_files), and the answer goes into the spoken summary instead. The
+    user turns files on by asking for a file — when handing the task over, or
+    afterwards with agent_task 'save'. Asked for by the user ("dont allow it
+    write report until i say explicitly"); a prompt alone was not enough,
+    because the conversation model once added "save it to the desktop" to a
+    goal on its own.
     The irreversible-action gate (core/confirm.py) still applies, and the agent
     WAITS for the user's CONFIRM or CANCEL and is told which it was. One task
     runs at a time — the tools share one mouse, one keyboard and one browser —
@@ -114,6 +122,8 @@ class Task:
     model: str = ""              # the model on the latest turn
     error: str = ""
     runs: int = 0
+    allow_files: bool = False    # the user explicitly asked for a file
+    followup: str = ""           # what the user asked for when resuming it
 
     @classmethod
     def from_dict(cls, d: dict) -> "Task":
@@ -266,9 +276,10 @@ _BUILTIN_DECLS = [
             "properties": {
                 "summary": {
                     "type": "STRING",
-                    "description": ("2-5 sentences in English: the result first, then the "
-                                    "concrete facts (numbers, names, file paths), then what "
-                                    "was not done and why."),
+                    "description": ("2-6 sentences in English: the answer itself first — "
+                                    "unless a file was asked for, this is everything the user "
+                                    "gets — then the concrete facts (numbers, names, sources, "
+                                    "any file path), then what was not done and why."),
                 },
                 "outcome": {"type": "STRING", "description": "success | partial | failed"},
             },
@@ -311,10 +322,15 @@ the most reasonable reading and carry on.
 goal explicitly asks for it. Irreversible actions put a CONFIRM button in front of the user: if \
 they cancel, accept it and adapt.
 
+FILES
+- Create or save a file ONLY when the brief says FILES: ALLOWED. Otherwise do not write any \
+report, note, list or document to disk by any route — no file tools, no code tools, no typing \
+into an editor. Such calls are refused. Put the answer in the finish summary; the user can ask \
+you to save it afterwards.
+- When files are allowed, save the deliverable where the goal says (the Desktop if it does not \
+say), as clear Markdown or plain text with sources, and name the path in the summary.
+
 FINISHING
-- Deliverables the user will keep (a report, a list, a plan, code) go into a file, on the \
-Desktop unless the goal says otherwise, and the summary names the path. Write reports as clear \
-Markdown or plain text with sources.
 - Call finish exactly once, when the goal is met or cannot be met. Write the summary in \
 English; the assistant says it in the user's language.
 
@@ -341,6 +357,7 @@ class AgentManager:
         self._worker: Optional[threading.Thread] = None
         self._cancel: dict[str, threading.Event] = {}
         self._replies: dict[str, list[str]] = {}
+        self._inbox: dict[str, list[str]] = {}    # instructions for a running task
         self._reply_ev: dict[str, threading.Event] = {}
         self._last_spoken = 0.0
         self._last_save = 0.0
@@ -377,9 +394,10 @@ class AgentManager:
             return [t for t in stopped if t.status == "interrupted"]
 
     # ── public API (any thread; nothing here blocks) ──────────────────────
-    def start(self, goal: str) -> Task:
+    def start(self, goal: str, allow_files: bool = False) -> Task:
         goal = str(goal or "").strip()
-        t = Task(id=uuid.uuid4().hex[:6], goal=goal, created=_now(), updated=_now())
+        t = Task(id=uuid.uuid4().hex[:6], goal=goal, created=_now(), updated=_now(),
+                 allow_files=bool(allow_files))
         with self._lock:
             self._tasks[t.id] = t
             self._queue.append(t.id)
@@ -390,17 +408,23 @@ class AgentManager:
         self._kick()
         return t
 
-    def resume(self, task_id: str = "") -> Optional[Task]:
+    def resume(self, task_id: str = "", followup: str = "",
+               allow_files: bool = False) -> Optional[Task]:
         with self._lock:
             t = self._find(task_id, lambda x: x.status not in ACTIVE)
             if t is None:
                 return None
+            if followup:
+                t.followup = str(followup).strip()
+            if allow_files:
+                t.allow_files = True
             t.status = "queued"
             t.finished = 0.0
             t.error = ""
             t.question = ""
             self._queue.append(t.id)
-        self._entry(t, "sys", "Resumed by the user.")
+        self._entry(t, "sys", "Resumed by the user."
+                    + (f" New instruction: {t.followup}" if followup else ""))
         self._persist(force=True)
         self._changed(t, reveal=True)
         self._kick()
@@ -423,6 +447,25 @@ class AgentManager:
             rev = self._reply_ev.get(t.id)
             if rev:
                 rev.set()
+        self._persist(force=True)
+        self._changed(t)
+        return t
+
+    def instruct(self, task_id: str, text: str, allow_files: bool = False) -> Optional[Task]:
+        """Something new from the user for a task. A running one reads it before
+        its next step; a finished or stopped one is resumed to act on it."""
+        text = str(text or "").strip()
+        with self._lock:
+            t = self._find(task_id)
+            if t is None:
+                return None
+            if t.status in ACTIVE:
+                if allow_files:
+                    t.allow_files = True
+                self._inbox.setdefault(t.id, []).append(text)
+                self._entry(t, "reply", f"New instruction: {text}")
+        if t.status not in ACTIVE:
+            return self.resume(t.id, followup=text, allow_files=allow_files)
         self._persist(force=True)
         self._changed(t)
         return t
@@ -657,6 +700,14 @@ class AgentManager:
                               else f"{int(max_secs // 60)} minutes")
                 return
 
+            with self._lock:
+                news = self._inbox.pop(t.id, [])
+            if news:
+                contents.append(types.Content(role="user", parts=[types.Part(text=(
+                    "NEW INSTRUCTION FROM THE USER: " + " / ".join(news)
+                    + ("\nFILES: ALLOWED now — the user asked for a file."
+                       if t.allow_files else "")))]))
+
             if self._size(contents) > _CONTEXT_BUDGET:
                 contents = self._compact(t, contents, keep=_KEEP_RECENT)
 
@@ -810,9 +861,16 @@ class AgentManager:
         label = _LABELS.get(name) or f"{name} {_short(_fmt_args(args), 90)}".strip()
         self._set(t, current=label)
         started = time.monotonic()
+        writes = "" if t.allow_files else _writes_files(name, args)
         try:
             handler = getattr(self, f"_tool_{name}", None) if name in _BUILTIN_NAMES else None
-            if handler is not None:
+            if writes:
+                result = (f"REFUSED — {writes}. The user has not asked for a file, so nothing "
+                          f"may be created or saved on disk, by this tool or any other. Give "
+                          f"the result in your finish summary instead; the user can ask for a "
+                          f"file afterwards.")
+                self._entry(t, "error", f"Blocked: {writes} (files are off for this task)")
+            elif handler is not None:
                 result = handler(t, args)
             elif self._execute is not None:
                 result = self._execute(name, args, lambda s: self._entry(t, "tool_say", s))
@@ -978,12 +1036,12 @@ class AgentManager:
         self._entry(t, "done", summary)
         status = "done" if outcome != "failed" else "failed"
         self._set(t, status=status, outcome=outcome, summary=summary,
-                  finished=_now(), current="", question="")
+                  finished=_now(), current="", question="", followup="")
         self._log(f"AGENT: Task {t.id} {outcome} — {_short(summary, 110)}")
         word = {"success": "finished", "partial": "finished in part",
                 "failed": "could not be completed"}[outcome]
-        self._say(f'The background task "{_short(t.goal, 80)}" {word}. Report to the user in '
-                  f"two or three sentences: {summary}", urgent=True)
+        self._say(f'The background task "{_short(t.goal, 80)}" {word}. Tell the user the '
+                  f"result with its concrete facts, in a few sentences: {summary}", urgent=True)
 
     def _fail(self, t: Task, why: str) -> None:
         self._tick(t)
@@ -1045,6 +1103,14 @@ class AgentManager:
                     f"{i + 1}. [{s['status']}] {s['title']}" for i, s in enumerate(t.plan)))
             if t.notes:
                 lines.append("YOUR NOTES:\n" + "\n".join(f"- {n}" for n in t.notes))
+            if resumed and t.summary:
+                lines.append(f"RESULT REPORTED LAST TIME:\n{t.summary}")
+            if t.followup:
+                lines.append(f"NEW INSTRUCTION FROM THE USER:\n{t.followup}\nDo this — and "
+                             f"only this, unless the goal is still unfinished.")
+            lines.append("FILES: ALLOWED — the user asked for a file." if t.allow_files else
+                         "FILES: NOT ALLOWED — the user has not asked for a file. Give the "
+                         "result in the finish summary; do not write anything to disk.")
             digest = digest or t.digest
             if digest:
                 lines.append("PROGRESS SO FAR (summary of earlier steps):\n" + digest)
@@ -1109,6 +1175,27 @@ class AgentManager:
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+# Calls that put something on disk, by tool and action. code_helper's default
+# action is 'auto', which may write, so a missing action counts as writing.
+_FILE_WRITES = {
+    "file_controller": {"create_file", "write", "create_folder"},
+    "code_helper":     {"write", "edit", "build", "auto", ""},
+}
+
+
+def _writes_files(name: str, args: dict) -> str:
+    """What this call would write to disk, in words — '' when it writes nothing."""
+    if name == "dev_agent":
+        return "dev_agent builds a project on disk"
+    acts = _FILE_WRITES.get(name)
+    if acts is None:
+        return ""
+    action = str((args or {}).get("action") or "").strip().lower()
+    if action in acts:
+        return f"{name} {action or 'auto'} would write a file"
+    return ""
+
 
 def _fmt_args(args: dict) -> str:
     bits = []

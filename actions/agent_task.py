@@ -14,6 +14,10 @@ def _since(t) -> str:
     return f"{secs // 60} min {secs % 60} s" if secs >= 60 else f"{secs} s"
 
 
+def _truthy(v) -> bool:
+    return v is True or str(v).strip().lower() in ("true", "yes", "1")
+
+
 def agent_task(parameters: dict, player=None) -> str:
     action = str(parameters.get("action") or "start").strip().lower()
     task_id = str(parameters.get("task_id") or "").strip().lower()
@@ -24,7 +28,7 @@ def agent_task(parameters: dict, player=None) -> str:
         if len(goal) < 8:
             return "Give the agent the whole goal in one or two sentences, with every detail the user gave."
         busy = [t for t in mgr.tasks() if t.status in agent.ACTIVE]
-        t = mgr.start(goal)
+        t = mgr.start(goal, allow_files=_truthy(parameters.get("save_file")))
         if busy:
             return (f"[AGENT_QUEUED] Task {t.id} is queued behind the task already running "
                     f"(\"{busy[0].goal[:80]}\") — one runs at a time. Tell the user that in ONE "
@@ -74,13 +78,23 @@ def agent_task(parameters: dict, player=None) -> str:
         return (f"[AGENT_STARTED] Task {t.id} is resuming: {t.goal}\n"
                 f"Tell the user in ONE short sentence. It picks up from its plan and notes.")
 
+    if action == "save":
+        where = str(parameters.get("message") or "").strip()
+        text = ("Save the result to a file" + (f": {where}" if where else " on the Desktop")
+                + ", then finish and name the path.")
+        t = mgr.instruct(task_id, text, allow_files=True)
+        if t is None:
+            return "There is no task to save."
+        return (f"[AGENT_SAVING] Task {t.id} will save its result to a file now. Confirm in "
+                f"one short sentence.")
+
     if action == "show":
         if player is not None and hasattr(player, "show_agent_window"):
             player.show_agent_window()
             return "The Tasks window is open."
         return "The Tasks window is not available."
 
-    return "Unknown action. Use start, status, reply, cancel, resume, list or show."
+    return "Unknown action. Use start, status, reply, save, cancel, resume, list or show."
 
 
 TOOL = {
@@ -90,19 +104,21 @@ TOOL = {
         "background with all of your tools — web search, reading pages, the browser, files, "
         "apps, code, the screen — while you keep talking, and reports back when it is done "
         "or needs the user. Use action='start' whenever a request takes several steps or more "
-        "than about a minute: research and compare, write a report or document to a file, "
-        "plan something, organise files, build or fix a project, gather information from "
-        "several sites, any job with 'and then'. Do NOT use it for a single quick action you "
-        "can do with one of your own tools. Other actions: 'status' (how is the task going), "
-        "'reply' (the user's answer to a question the agent asked), 'cancel', 'resume' "
-        "(continue a stopped or interrupted task), 'list', 'show' (open the Tasks window)."
+        "than about a minute: research and compare, plan something, organise files, build "
+        "or fix a project, gather information from several sites, any job with 'and then'. "
+        "Do NOT use it for a single quick action you can do with one of your own tools. "
+        "It writes NO files unless save_file is true. Other actions: 'status' (how is the "
+        "task going), 'reply' (the user's answer to a question the agent asked), 'save' "
+        "(the user now asks for a task's result to be saved to a file; 'message' = where, "
+        "if they said), 'cancel', 'resume' (continue a stopped or interrupted task), "
+        "'list', 'show' (open the Tasks window)."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "action": {
                 "type": "STRING",
-                "description": "start | status | reply | cancel | resume | list | show",
+                "description": "start | status | reply | save | cancel | resume | list | show",
             },
             "goal": {
                 "type": "STRING",
@@ -110,7 +126,15 @@ TOOL = {
                     "For start: the complete goal in English with every detail the user "
                     "gave — what to do, where to save results, limits, preferences. The agent "
                     "cannot hear this conversation, so leave nothing implied. Add nothing "
-                    "they did not ask for: no file unless they asked for one saved."),
+                    "they did not ask for — never 'save a report' unless they said so."),
+            },
+            "save_file": {
+                "type": "BOOLEAN",
+                "description": (
+                    "For start: true ONLY if the user's own words explicitly ask to save, "
+                    "write or create a file, report or document. Never infer it from the "
+                    "kind of task. Default false: the agent then writes nothing to disk and "
+                    "reports by voice."),
             },
             "task_id": {
                 "type": "STRING",
@@ -118,7 +142,8 @@ TOOL = {
             },
             "message": {
                 "type": "STRING",
-                "description": "For reply: the user's answer, in English.",
+                "description": ("For reply: the user's answer, in English. For save: where "
+                                "they want the file, if they said."),
             },
         },
         "required": ["action"],

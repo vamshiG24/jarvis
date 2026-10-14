@@ -2372,6 +2372,7 @@ class AgentWindow(QWidget):
                 f"{t.get('steps', 0)} step{'' if t.get('steps') == 1 else 's'}"]
         if t.get("started"):
             bits.append(f"{mins} min {secs:02d} s working")
+        bits.append("files on" if t.get("allow_files") else "files off")
         if t.get("model"):
             bits.append(str(t["model"]))
         self._meta.setText(f"<span style='color:{C.TEXT_MED}'>"

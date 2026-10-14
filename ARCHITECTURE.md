@@ -427,6 +427,17 @@ the task log instead of the speakers. On top of those it has its own tools:
 `system_status`, `recall_memory`, `wait`, `tell_user`, `ask_user` and `finish`.
 It is never given `agent_task` itself, `holo_control` or `shutdown_jarvis`.
 
+**No files unless the user asked.** A task starts with `allow_files` off. Before
+any tool runs, `_writes_files` checks the call: `file_controller`
+create_file / write / create_folder, `code_helper` write / edit / build / auto,
+and every `dev_agent` call are refused, and the model is told to put the answer
+in its summary. This is code, not only a prompt rule: the conversation model
+once added "save it to the desktop" to a goal the user never asked to save.
+Files are switched on by `agent_task(start, save_file=true)`, which is meant
+only for the user's explicit words, or later by `agent_task(save)`. That
+reaches a running task through its inbox before the next step, and resumes a
+finished one with the instruction and its earlier result in the brief.
+
 ```mermaid
 flowchart TB
     START["queued → running<br/>brief = goal (+ plan, notes, digest when resumed)"] --> CHK{"cancelled?<br/>budget spent?"}
